@@ -1,5 +1,7 @@
 # ============================================================
-# Email journeys — Single-file Flask App (Final)
+# Email journeys — Single-file Flask App (Neon Nexus Edition)
+# Includes: Converter, Generators, Blocklist, Email Hunter
+# Session: 1 hour  |  Theme: Neon Nexus
 # ============================================================
 from flask import Flask, request, jsonify, session, redirect, url_for, Response
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -9,17 +11,28 @@ from datetime import timedelta
 import base64, random, string, secrets, socket, ipaddress, os, threading, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# --- Email Hunter deps (optional; app still runs if missing) ---
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    import re as _re_h
+    from urllib.parse import urljoin, urlparse, urlunparse
+    from collections import deque as _deque_h
+    HAS_HUNTER = True
+except ImportError:
+    HAS_HUNTER = False
+
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET_123456789")
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=False,
-    PERMANENT_SESSION_LIFETIME=timedelta(minutes=10),
-    SESSION_REFRESH_EACH_REQUEST=False,   # absolute timeout, not inactivity
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=1),   # ← was 10 minutes
+    SESSION_REFRESH_EACH_REQUEST=False,
 )
 
-SESSION_MAX_AGE = 10 * 60  # 10 minutes in seconds
+SESSION_MAX_AGE = 60 * 60   # ← 1 hour in seconds (was 10 * 60)
 
 LOGIN_USERNAME = os.environ.get("LOGIN_USERNAME", "admin")
 LOGIN_PASSWORD_HASH = generate_password_hash(os.environ.get("LOGIN_PASSWORD", "admin"))
@@ -42,113 +55,339 @@ def _handle_any_error(e):
 
 
 # ============================================================
-# INDEX_HTML
+# Email Hunter — crawler + extractor
+# ============================================================
+if HAS_HUNTER:
+    HUNTER_MAX_TIME = 120
+    HUNTER_TIMEOUT = 15
+    HUNTER_UA = "Mozilla/5.0 (compatible; EmailHunter/1.0)"
+    HUNTER_LINK_ATTRS = ["href", "src", "data-url", "data-href", "onclick"]
+    HUNTER_CONTACT_KEYWORDS = [
+        "contact", "kontakt", "impressum", "about", "team",
+        "directory", "service", "support", "help", "info"
+    ]
+
+    _EMAIL_RE = _re_h.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+    _OBFUSCATED_RE = _re_h.compile(
+        r"([a-zA-Z0-9._%+\-]+)\s*(?:\[at\]|\(at\)|\bat\b)\s*"
+        r"([a-zA-Z0-9.\-]+)\s*(?:\[dot\]|\(dot\)|\bdot\b)\s*"
+        r"([a-zA-Z]{2,})",
+        _re_h.IGNORECASE
+    )
+    _BAD_EXT = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp",
+                ".css", ".js", ".ico", ".woff", ".woff2", ".ttf")
+
+    def _is_valid_email(e):
+        if not e or len(e) > 254 or e.count("@") != 1:
+            return False
+        local, domain = e.split("@")
+        if not local or not domain or "." not in domain:
+            return False
+        if domain.startswith(".") or domain.endswith("."):
+            return False
+        if any(domain.endswith(x) for x in _BAD_EXT):
+            return False
+        if local.startswith(".") or local.endswith("."):
+            return False
+        return True
+
+    def hunter_extract_emails(text):
+        found = set()
+        for m in _EMAIL_RE.findall(text):
+            e = m.strip().rstrip(".,;:").lower()
+            if _is_valid_email(e):
+                found.add(e)
+        for local, mid, tld in _OBFUSCATED_RE.findall(text):
+            e = f"{local}@{mid}.{tld}".lower()
+            if _is_valid_email(e):
+                found.add(e)
+        return found
+
+    class EmailHunterCrawler:
+        def __init__(self, start_url):
+            self.start_url = start_url.rstrip("/")
+            self.domain = urlparse(start_url).netloc
+            self.visited = set()
+            self.queue = _deque_h()
+            self.emails = set()
+            self.stats = {
+                "pages_visited": 0, "contact_pages": 0,
+                "errors": 0, "discovered": 0, "visited": 0,
+            }
+            self.start_time = None
+
+        def _is_internal(self, url):
+            p = urlparse(url)
+            return p.netloc == self.domain or p.netloc == ""
+
+        def _normalize(self, base, link):
+            try:
+                absolute = urljoin(base, link)
+                p = urlparse(absolute)
+                if p.scheme not in ("http", "https"):
+                    return None
+                return urlunparse(p._replace(fragment=""))
+            except Exception:
+                return None
+
+        def _is_contact(self, url):
+            path = urlparse(url).path.lower()
+            return any(kw in path for kw in HUNTER_CONTACT_KEYWORDS)
+
+        def _extract_links(self, soup, base_url):
+            links = set()
+            for tag in soup.find_all(True):
+                for attr in HUNTER_LINK_ATTRS:
+                    val = tag.get(attr)
+                    if not val:
+                        continue
+                    if attr == "onclick":
+                        m = _re_h.search(r"['\"]([^'\"]+)['\"]", str(val))
+                        if m:
+                            val = m.group(1)
+                        else:
+                            continue
+                    cand = self._normalize(base_url, val)
+                    if cand and self._is_internal(cand):
+                        links.add(cand)
+            return links
+
+        def _fetch(self, url):
+            try:
+                r = requests.get(
+                    url, headers={"User-Agent": HUNTER_UA},
+                    timeout=HUNTER_TIMEOUT, allow_redirects=True,
+                )
+                return r.text if r.status_code == 200 else None
+            except Exception:
+                self.stats["errors"] += 1
+                return None
+
+        def _discover_sitemaps(self):
+            sitemaps = []
+            try:
+                r = requests.get(
+                    f"{self.start_url}/robots.txt",
+                    headers={"User-Agent": HUNTER_UA}, timeout=10,
+                )
+                if r.status_code == 200:
+                    for line in r.text.splitlines():
+                        if line.lower().startswith("sitemap:"):
+                            sitemaps.append(line.split(":", 1)[1].strip())
+            except Exception:
+                pass
+            for path in ["/sitemap.xml", "/sitemap", "/site-map", "/sitemap_index.xml"]:
+                sitemaps.append(urljoin(self.start_url, path))
+            return list(set(sitemaps))
+
+        def _parse_sitemap(self, sm_url):
+            urls = set()
+            try:
+                r = requests.get(sm_url, headers={"User-Agent": HUNTER_UA}, timeout=10)
+                if r.status_code != 200:
+                    return urls
+                soup = BeautifulSoup(r.text, "xml")
+                for loc in soup.find_all("loc"):
+                    urls.add(loc.text.strip())
+            except Exception:
+                pass
+            return urls
+
+        def _prioritize(self):
+            prior, rest = [], []
+            while self.queue:
+                u = self.queue.popleft()
+                (prior if self._is_contact(u) else rest).append(u)
+            self.queue = _deque_h(prior + rest)
+
+        def crawl(self):
+            self.start_time = time.time()
+            self.queue.append(self.start_url)
+
+            for sm in self._discover_sitemaps():
+                for u in self._parse_sitemap(sm):
+                    if self._is_internal(u) and u not in self.visited:
+                        self.queue.append(u)
+
+            while self.queue and (time.time() - self.start_time) < HUNTER_MAX_TIME:
+                self._prioritize()
+                url = self.queue.popleft()
+                if url in self.visited:
+                    continue
+                self.visited.add(url)
+                self.stats["visited"] += 1
+
+                html = self._fetch(url)
+                if not html:
+                    continue
+
+                self.stats["pages_visited"] += 1
+                if self._is_contact(url):
+                    self.stats["contact_pages"] += 1
+
+                self.emails.update(hunter_extract_emails(html))
+
+                try:
+                    soup = BeautifulSoup(html, "html.parser")
+                except Exception:
+                    continue
+
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    if href.lower().startswith("mailto:"):
+                        e = href[7:].split("?")[0].strip().lower()
+                        if _is_valid_email(e):
+                            self.emails.add(e)
+
+                for link in self._extract_links(soup, url):
+                    if link not in self.visited and link not in self.queue:
+                        self.queue.append(link)
+                        self.stats["discovered"] += 1
+
+            self.stats["emails"] = len(self.emails)
+            self.stats["time_taken"] = round(time.time() - self.start_time, 2)
+            return {"emails": sorted(self.emails), "stats": self.stats}
+
+    _hunter_store = {}
+    _hunter_status = {}
+
+
+# ============================================================
+# INDEX_HTML — Neon Nexus Theme
 # ============================================================
 INDEX_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Email journeys</title>
-<meta name="description" content="Email journey toolkit — UTF-8 Q, Base64 encoder/decoder, random generators and bulk blocklist checks.">
+<title>Email journeys — Neon Nexus</title>
+<meta name="description" content="Email journey toolkit — encoder, generators, blocklist checks and email hunter, in a neon-lit command center.">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
 :root{
-  --radius:20px;
-  --bg:#fdf8f0;
-  --bg-soft:#f6efe2;
-  --panel:#ffffff;
-  --panel2:#fbf4e9;
-  --text:#1c1613;
-  --text-soft:#5c524a;
-  --muted:#8c8078;
-  --line:#efe2cf;
-  --line2:#dfcbb0;
-  --accent:#e05a3a;
-  --accent2:#e89b3c;
-  --accent3:#d94a7a;
-  --ok:#4d8a5e;
-  --warn:#c07a1a;
-  --danger:#c4394a;
-  --shadow:0 22px 50px rgba(120,80,50,.10);
-  --shadow-lg:0 34px 70px rgba(120,80,50,.16);
-  --glow:0 0 40px rgba(224,90,58,.18);
-}
-body.dark{
-  --bg:#100b0a;
-  --bg-soft:#181110;
-  --panel:#1a1413;
-  --panel2:#221a18;
-  --text:#f6ede2;
-  --text-soft:#cdbfb1;
-  --muted:#8e7f72;
-  --line:#2b2220;
-  --line2:#3d302c;
-  --accent:#ff8a65;
-  --accent2:#ffb356;
-  --accent3:#ff6f9c;
-  --ok:#6fbf85;
+  --radius:18px;
+  --bg:#07080f;
+  --bg-soft:#0c0e18;
+  --panel:rgba(18,22,38,.72);
+  --panel-2:rgba(24,28,48,.6);
+  --panel-solid:#121626;
+  --text:#e9ecf8;
+  --text-soft:#a9b2cb;
+  --muted:#697391;
+  --line:rgba(120,140,220,.14);
+  --line-strong:rgba(140,160,240,.28);
+  --cyan:#00e5ff;
+  --magenta:#ff2d95;
+  --lime:#b8ff2b;
+  --violet:#a855f7;
+  --ok:#3ddc84;
   --warn:#ffc247;
-  --danger:#ff7a8a;
-  --shadow:0 24px 60px rgba(0,0,0,.55);
-  --shadow-lg:0 36px 80px rgba(0,0,0,.65);
-  --glow:0 0 40px rgba(255,138,101,.22);
+  --danger:#ff5c8a;
+  --shadow:0 20px 50px rgba(0,0,0,.55);
+  --shadow-lg:0 34px 80px rgba(0,0,0,.7);
+  --glow-cyan:0 0 40px rgba(0,229,255,.30);
+  --glow-magenta:0 0 40px rgba(255,45,149,.28);
+  --glow-lime:0 0 40px rgba(184,255,43,.25);
+  --glow-violet:0 0 40px rgba(168,85,247,.30);
+}
+body.light{
+  --bg:#eef1fa;
+  --bg-soft:#e6ebf7;
+  --panel:rgba(255,255,255,.82);
+  --panel-2:rgba(240,244,255,.7);
+  --panel-solid:#ffffff;
+  --text:#0c1224;
+  --text-soft:#3e4666;
+  --muted:#6a7290;
+  --line:rgba(20,30,80,.12);
+  --line-strong:rgba(20,30,80,.24);
+  --cyan:#0091a8;
+  --magenta:#c8177a;
+  --lime:#5f8f00;
+  --violet:#6a2fd6;
+  --ok:#1e8a4d;
+  --warn:#b07700;
+  --danger:#c02a5c;
+  --shadow:0 20px 50px rgba(60,80,160,.14);
+  --shadow-lg:0 34px 80px rgba(60,80,160,.20);
+  --glow-cyan:0 0 40px rgba(0,145,168,.20);
+  --glow-magenta:0 0 40px rgba(200,23,122,.18);
+  --glow-lime:0 0 40px rgba(95,143,0,.18);
+  --glow-violet:0 0 40px rgba(106,47,214,.20);
 }
 
 *,*::before,*::after{box-sizing:border-box}
 html{scroll-behavior:smooth}
 body{
   margin:0;min-height:100vh;
-  font-family:'Outfit',system-ui,-apple-system,'Segoe UI',Roboto,Arial,sans-serif;
+  font-family:'Space Grotesk',system-ui,-apple-system,'Segoe UI',Roboto,Arial,sans-serif;
   font-weight:400;
   background:var(--bg);color:var(--text);
   -webkit-font-smoothing:antialiased;
   transition:background .35s ease,color .35s ease;
-  letter-spacing:-0.01em;
+  letter-spacing:-0.005em;
+  overflow-x:hidden;
 }
 code,pre,.mono,.output{font-family:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 
+/* Animated grid background */
+.bg-grid{
+  position:fixed;inset:0;z-index:0;pointer-events:none;
+  background-image:
+    linear-gradient(rgba(120,140,220,.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(120,140,220,.06) 1px, transparent 1px);
+  background-size:44px 44px;
+  mask-image:radial-gradient(ellipse 90% 70% at 50% 40%, #000 40%, transparent 100%);
+  -webkit-mask-image:radial-gradient(ellipse 90% 70% at 50% 40%, #000 40%, transparent 100%);
+}
+body.light .bg-grid{opacity:.5}
+
+/* Neon orbs */
 .bg-orbs{position:fixed;inset:0;overflow:hidden;pointer-events:none;z-index:0}
-.bg-orbs span{position:absolute;border-radius:50%;filter:blur(120px);opacity:.55;animation:drift 26s ease-in-out infinite}
-.bg-orbs span:nth-child(1){width:620px;height:620px;background:radial-gradient(circle,var(--accent),transparent 70%);top:-220px;left:-180px}
-.bg-orbs span:nth-child(2){width:520px;height:520px;background:radial-gradient(circle,var(--accent2),transparent 70%);top:-140px;right:-160px;animation-delay:-8s}
-.bg-orbs span:nth-child(3){width:520px;height:520px;background:radial-gradient(circle,var(--accent3),transparent 70%);bottom:-220px;left:38%;animation-delay:-16s}
-body.dark .bg-orbs span{opacity:.32}
+.bg-orbs span{position:absolute;border-radius:50%;filter:blur(120px);opacity:.45;animation:drift 26s ease-in-out infinite}
+.bg-orbs span:nth-child(1){width:620px;height:620px;background:radial-gradient(circle,var(--cyan),transparent 70%);top:-220px;left:-180px}
+.bg-orbs span:nth-child(2){width:520px;height:520px;background:radial-gradient(circle,var(--magenta),transparent 70%);top:-140px;right:-160px;animation-delay:-8s}
+.bg-orbs span:nth-child(3){width:520px;height:520px;background:radial-gradient(circle,var(--lime),transparent 70%);bottom:-220px;left:38%;animation-delay:-16s}
+.bg-orbs span:nth-child(4){width:420px;height:420px;background:radial-gradient(circle,var(--violet),transparent 70%);top:40%;right:10%;animation-delay:-12s}
+body.light .bg-orbs span{opacity:.25}
 @keyframes drift{0%,100%{transform:translate3d(0,0,0) scale(1)}50%{transform:translate3d(40px,-50px,0) scale(1.14)}}
 
-.app{position:relative;z-index:1;max-width:1260px;margin:0 auto;padding:22px 22px 0}
+.app{position:relative;z-index:1;max-width:1280px;margin:0 auto;padding:22px 22px 0}
 
+/* ---------- Top bar ---------- */
 .topbar{
   position:sticky;top:12px;z-index:40;
   display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;
   padding:12px 16px;margin:0 0 30px;
-  background:color-mix(in srgb,var(--panel) 78%,transparent);
-  backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
-  border:1px solid var(--line);border-radius:18px;
+  background:var(--panel);
+  backdrop-filter:blur(22px);-webkit-backdrop-filter:blur(22px);
+  border:1px solid var(--line);border-radius:16px;
   box-shadow:var(--shadow);
 }
 .brand{display:flex;align-items:center;gap:12px;cursor:pointer;user-select:none}
-.brand svg{width:42px;height:42px;flex:0 0 auto;filter:drop-shadow(0 6px 16px rgba(224,90,58,.30))}
-.brand b{display:block;font-size:15.5px;font-weight:700;letter-spacing:-.02em}
+.brand svg{width:42px;height:42px;flex:0 0 auto;filter:drop-shadow(0 6px 18px rgba(0,229,255,.4))}
+.brand b{display:block;font-size:15.5px;font-weight:600;letter-spacing:-.01em}
 .brand span{display:block;color:var(--muted);font-size:9.5px;letter-spacing:2px;margin-top:2px;font-weight:600}
 .nav{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 .nav button{
   border:1px solid transparent;background:transparent;color:var(--text-soft);
-  padding:9px 15px;border-radius:11px;cursor:pointer;font-weight:600;font-size:13.5px;
+  padding:9px 15px;border-radius:10px;cursor:pointer;font-weight:500;font-size:13.5px;
   transition:.2s ease;font-family:inherit;letter-spacing:-.01em;
 }
-.nav button:hover{color:var(--text);background:var(--panel2)}
+.nav button:hover{color:var(--text);background:var(--panel-2);border-color:var(--line)}
 .nav button.active{
-  color:#fff;background:linear-gradient(120deg,var(--accent),var(--accent2));
-  box-shadow:0 8px 22px rgba(224,90,58,.35);
+  color:#050612;background:linear-gradient(120deg,var(--cyan),var(--lime));
+  box-shadow:var(--glow-cyan);
+  font-weight:600;
 }
-.nav .icon-btn{padding:9px 13px;font-size:15px;background:var(--panel2);border:1px solid var(--line)}
+body.light .nav button.active{color:#fff}
+.nav .icon-btn{padding:9px 13px;font-size:15px;background:var(--panel-2);border:1px solid var(--line)}
 .nav .logout{
-  background:transparent;border:1px solid color-mix(in srgb,var(--danger) 35%,transparent);
-  color:var(--danger);font-weight:600;
+  background:transparent;border:1px solid color-mix(in srgb,var(--danger) 40%,transparent);
+  color:var(--danger);font-weight:500;
 }
 .nav .logout:hover{background:color-mix(in srgb,var(--danger) 12%,transparent);color:var(--danger)}
 
@@ -156,207 +395,377 @@ body.dark .bg-orbs span{opacity:.32}
 .page.active{display:block}
 @keyframes fade{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
 
-.home-hero{
-  display:grid;grid-template-columns:1.05fr .95fr;gap:36px;align-items:center;
-  padding:34px 8px 44px;
+/* ---------- HOME HERO (new layout) ---------- */
+.home-wrap{
+  display:grid;grid-template-columns:1.15fr .85fr;gap:48px;align-items:center;
+  padding:26px 6px 52px;
 }
-.hero-left{max-width:580px}
-.pill{
-  display:inline-flex;align-items:center;gap:8px;
-  padding:6px 14px;border-radius:99px;
-  font-size:12px;font-weight:600;letter-spacing:.02em;
-  background:color-mix(in srgb,var(--accent) 10%,transparent);
-  color:var(--accent);border:1px solid color-mix(in srgb,var(--accent) 25%,transparent);
+.hero-left{max-width:640px}
+.status-chip{
+  display:inline-flex;align-items:center;gap:9px;
+  padding:7px 15px;border-radius:99px;
+  font-size:11.5px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;
+  background:color-mix(in srgb,var(--cyan) 12%,transparent);
+  color:var(--cyan);border:1px solid color-mix(in srgb,var(--cyan) 35%,transparent);
+  font-family:'JetBrains Mono',monospace;
 }
-.pill .dot{width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 10px var(--accent);animation:pulse 1.8s ease-in-out infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-.hero-left h1{
-  font-size:clamp(38px,5.4vw,66px);line-height:1.02;margin:22px 0 18px;
-  letter-spacing:-.035em;font-weight:700;
+.status-chip .dot{width:7px;height:7px;border-radius:50%;background:var(--cyan);box-shadow:0 0 12px var(--cyan);animation:pulse 1.8s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.85)}}
+
+.hero-title{
+  font-size:clamp(42px,5.6vw,72px);line-height:.98;margin:24px 0 22px;
+  letter-spacing:-.04em;font-weight:700;
 }
-.hero-left h1 .swipe{
-  background:linear-gradient(100deg,var(--accent),var(--accent2),var(--accent3));
+.hero-title .line-1{display:block;color:var(--text)}
+.hero-title .line-2{
+  display:block;font-weight:500;
+  background:linear-gradient(100deg,var(--cyan) 0%,var(--lime) 30%,var(--magenta) 60%,var(--violet) 100%);
   -webkit-background-clip:text;background-clip:text;color:transparent;
-  background-size:220% auto;animation:shine 7s linear infinite;font-style:italic;font-weight:800;
+  background-size:220% auto;animation:shine 8s linear infinite;
 }
 @keyframes shine{to{background-position:220% center}}
-.hero-left p.lede{
-  color:var(--text-soft);font-size:16.5px;line-height:1.7;margin:0 0 26px;max-width:540px;
-}
-.hero-cta{display:flex;gap:10px;flex-wrap:wrap}
-.micro-stats{display:flex;gap:22px;margin-top:32px;padding-top:26px;border-top:1px solid var(--line);flex-wrap:wrap}
-.micro-stats div{display:flex;flex-direction:column;gap:2px}
-.micro-stats b{font-size:22px;font-weight:700;letter-spacing:-.03em;line-height:1}
-.micro-stats span{font-size:11.5px;color:var(--muted);font-weight:500;letter-spacing:.02em}
 
-.hero-right{position:relative}
-.preview-window{
-  position:relative;border-radius:22px;overflow:hidden;
+.hero-desc{
+  color:var(--text-soft);font-size:16px;line-height:1.75;margin:0 0 30px;max-width:560px;
+}
+.hero-desc code{
+  background:color-mix(in srgb,var(--cyan) 12%,transparent);
+  color:var(--cyan);padding:2px 7px;border-radius:6px;
+  font-size:13px;font-family:'JetBrains Mono',monospace;
+  border:1px solid color-mix(in srgb,var(--cyan) 22%,transparent);
+}
+
+.hero-actions{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:34px}
+
+/* Terminal preview */
+.terminal{
+  background:#05060c;
+  border:1px solid rgba(0,229,255,.20);
+  border-radius:14px;overflow:hidden;
+  box-shadow:var(--shadow-lg), 0 0 60px rgba(0,229,255,.08);
+  font-family:'JetBrains Mono',monospace;
+  position:relative;
+}
+.terminal::before{
+  content:'';position:absolute;inset:0;border-radius:14px;padding:1px;
+  background:linear-gradient(135deg,rgba(0,229,255,.4),transparent 40%,rgba(255,45,149,.4));
+  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor;mask-composite:exclude;
+  pointer-events:none;
+}
+.term-bar{
+  display:flex;align-items:center;gap:8px;padding:11px 14px;
+  background:rgba(10,12,22,.9);border-bottom:1px solid rgba(120,140,220,.12);
+}
+.term-bar .dot{width:10px;height:10px;border-radius:50%}
+.term-bar .dot.r{background:#ff5f57}
+.term-bar .dot.y{background:#ffbd2e}
+.term-bar .dot.g{background:#28c840}
+.term-bar b{margin-left:8px;font-size:11.5px;font-weight:500;color:var(--muted);letter-spacing:.06em}
+.term-body{padding:20px 18px;font-size:12px;line-height:1.85;color:var(--text-soft)}
+.term-line{display:flex;gap:12px;padding:3px 0;word-break:break-all}
+.term-prompt{color:var(--lime);flex:0 0 auto;font-weight:500}
+.term-out{color:#8b9bc6}
+.term-out.cyan{color:var(--cyan)}
+.term-out.magenta{color:var(--magenta)}
+.term-out.lime{color:var(--lime)}
+.term-cursor{display:inline-block;width:8px;height:14px;background:var(--cyan);margin-left:4px;animation:blink 1s steps(1) infinite;vertical-align:middle}
+@keyframes blink{50%{opacity:0}}
+
+/* Quick stats bar */
+.quick-stats{
+  display:grid;grid-template-columns:repeat(4,1fr);gap:14px;
+  margin-bottom:52px;
+}
+.qs-card{
+  padding:22px 20px;border-radius:16px;
   background:var(--panel);border:1px solid var(--line);
-  box-shadow:var(--shadow-lg);transform:rotate(-1.2deg);
-  transition:transform .5s ease;
-}
-.preview-window:hover{transform:rotate(0deg) translateY(-4px)}
-.window-bar{
-  display:flex;align-items:center;gap:8px;padding:12px 16px;
-  background:var(--panel2);border-bottom:1px solid var(--line);
-}
-.window-bar .dot{width:10px;height:10px;border-radius:50%}
-.window-bar .dot.r{background:#ff5f57}.window-bar .dot.y{background:#ffbd2e}.window-bar .dot.g{background:#28c840}
-.window-bar b{margin-left:8px;font-size:12px;font-weight:600;color:var(--muted);letter-spacing:.04em}
-.window-body{padding:20px;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.9}
-.win-line{display:flex;gap:10px;align-items:flex-start;padding:5px 0;word-break:break-all}
-.win-tag{
-  flex:0 0 auto;font-size:10px;font-weight:700;letter-spacing:.06em;
-  padding:2px 8px;border-radius:6px;margin-top:2px;
-}
-.tag-in{background:color-mix(in srgb,var(--accent) 15%,transparent);color:var(--accent)}
-.tag-q1{background:color-mix(in srgb,var(--accent2) 18%,transparent);color:var(--accent2)}
-.tag-q2{background:color-mix(in srgb,var(--accent3) 15%,transparent);color:var(--accent3)}
-.tag-b64{background:color-mix(in srgb,var(--ok) 15%,transparent);color:var(--ok)}
-.win-text{color:var(--text-soft);font-size:11.5px;line-height:1.6}
-
-.stats-strip{
-  display:grid;grid-template-columns:repeat(4,1fr);gap:2px;
-  background:var(--line);border-radius:20px;overflow:hidden;
-  border:1px solid var(--line);margin-bottom:44px;
-}
-.stats-strip > div{padding:26px 22px;background:var(--panel);text-align:center}
-.stats-strip b{display:block;font-size:34px;font-weight:700;letter-spacing:-.04em;line-height:1;margin-bottom:6px;
-  background:linear-gradient(120deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent;}
-.stats-strip span{font-size:11.5px;color:var(--muted);font-weight:500;letter-spacing:.02em}
-
-.bento{display:grid;grid-template-columns:1.4fr 1fr 1fr;grid-template-rows:auto auto;gap:16px;margin-bottom:20px}
-.bento-card{
-  padding:28px;border-radius:22px;
-  background:var(--panel);border:1px solid var(--line);
-  box-shadow:var(--shadow);position:relative;overflow:hidden;
+  backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
+  box-shadow:var(--shadow);
+  position:relative;overflow:hidden;
   transition:.3s ease;
 }
-.bento-card:hover{transform:translateY(-3px);box-shadow:var(--shadow-lg);border-color:var(--line2)}
-.bento-card.big{grid-column:1/3;grid-row:1}
-.bento-card.tall{grid-column:3/4;grid-row:1/3}
-.bento-card.wide{grid-column:1/3;grid-row:2}
-.bento-card .bic{
-  width:46px;height:46px;border-radius:14px;display:grid;place-items:center;font-size:22px;margin-bottom:16px;
-  background:linear-gradient(135deg,color-mix(in srgb,var(--accent) 18%,transparent),color-mix(in srgb,var(--accent2) 18%,transparent));
-  border:1px solid color-mix(in srgb,var(--accent) 20%,transparent);
+.qs-card::before{
+  content:'';position:absolute;top:0;left:0;right:0;height:2px;
+  background:linear-gradient(90deg,var(--cyan),var(--magenta),var(--lime));
+  opacity:.7;
 }
-.bento-card h3{margin:0 0 8px;font-size:19px;font-weight:700;letter-spacing:-.02em}
-.bento-card p{color:var(--text-soft);font-size:13.5px;line-height:1.65;margin:0;max-width:520px}
-.bento-card .baa{
-  display:inline-flex;align-items:center;gap:6px;margin-top:16px;
-  font-size:12.5px;font-weight:600;color:var(--accent);cursor:pointer;
+.qs-card:hover{transform:translateY(-4px);border-color:var(--line-strong);box-shadow:var(--shadow-lg)}
+.qs-num{
+  display:block;font-size:30px;font-weight:700;letter-spacing:-.04em;line-height:1;margin-bottom:8px;
+  background:linear-gradient(120deg,var(--cyan),var(--magenta));
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.qs-lbl{font-size:11px;color:var(--muted);letter-spacing:.14em;text-transform:uppercase;font-weight:500}
+
+/* Feature grid */
+.feature-grid{
+  display:grid;grid-template-columns:repeat(6,1fr);gap:18px;margin-bottom:32px;
+}
+.feat{
+  grid-column:span 3;
+  padding:28px;border-radius:20px;
+  background:var(--panel);border:1px solid var(--line);
+  backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);
+  box-shadow:var(--shadow);
+  position:relative;overflow:hidden;
+  transition:.35s ease;
+  cursor:pointer;
+}
+.feat:hover{
+  transform:translateY(-4px);
+  border-color:var(--line-strong);
+  box-shadow:var(--shadow-lg);
+}
+.feat:hover .feat-glow{opacity:1}
+.feat-glow{
+  position:absolute;inset:0;opacity:0;transition:.4s ease;pointer-events:none;
+  background:radial-gradient(circle at 20% 0%, var(--glow-color,var(--cyan)) 0%, transparent 55%);
+  opacity:0;
+}
+.feat.f-cyan{--glow-color:var(--cyan);--accent-color:var(--cyan)}
+.feat.f-magenta{--glow-color:var(--magenta);--accent-color:var(--magenta)}
+.feat.f-lime{--glow-color:var(--lime);--accent-color:var(--lime)}
+.feat.f-violet{--glow-color:var(--violet);--accent-color:var(--violet)}
+.feat:hover .feat-glow{opacity:.9}
+.feat-inner{position:relative;z-index:1}
+.feat-tag{
+  display:inline-block;font-family:'JetBrains Mono',monospace;
+  font-size:10px;font-weight:600;letter-spacing:.14em;
+  padding:3px 9px;border-radius:6px;
+  color:var(--accent-color);
+  background:color-mix(in srgb,var(--accent-color) 14%,transparent);
+  border:1px solid color-mix(in srgb,var(--accent-color) 30%,transparent);
+  margin-bottom:16px;
+  text-transform:uppercase;
+}
+.feat h3{margin:0 0 10px;font-size:20px;font-weight:600;letter-spacing:-.02em;line-height:1.25}
+.feat p{color:var(--text-soft);font-size:13.5px;line-height:1.7;margin:0}
+.feat-btn{
+  display:inline-flex;align-items:center;gap:8px;margin-top:20px;
+  font-size:13px;font-weight:600;color:var(--accent-color);cursor:pointer;
   border:0;background:transparent;padding:0;font-family:inherit;
+  transition:.25s ease;
 }
-.bento-card .baa:hover{gap:10px}
-.bento-card .baa::after{content:'→';transition:.2s}
+.feat-btn:hover{gap:12px}
+.feat-btn .arrow{transition:.25s ease}
+.feat-btn:hover .arrow{transform:translateX(3px)}
+.feat.wide{grid-column:span 6}
 
-.section-head{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;margin:4px 0 20px;flex-wrap:wrap}
-.section-head h2{margin:0;font-size:28px;letter-spacing:-.03em;font-weight:700}
-.section-head p{margin:6px 0 0;color:var(--muted);font-size:13.5px;line-height:1.65;max-width:760px}
+/* ---------- Section head ---------- */
+.section-head{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;margin:4px 0 22px;flex-wrap:wrap}
+.section-head h2{margin:0;font-size:28px;letter-spacing:-.03em;font-weight:600}
+.section-head h2 .accent{
+  background:linear-gradient(100deg,var(--cyan),var(--magenta));
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.section-head p{margin:6px 0 0;color:var(--muted);font-size:13.5px;line-height:1.7;max-width:760px}
 
-.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:24px;box-shadow:var(--shadow)}
-.card h3{margin:0 0 16px;font-size:16px;font-weight:700;letter-spacing:-.02em}
+/* ---------- Cards ---------- */
+.card{
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  padding:24px;box-shadow:var(--shadow);
+  backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
+}
+.card h3{margin:0 0 16px;font-size:16px;font-weight:600;letter-spacing:-.01em}
 
-.tabs{display:flex;gap:6px;margin-bottom:20px;flex-wrap:wrap;padding:5px;background:var(--panel2);border-radius:14px;width:fit-content;border:1px solid var(--line)}
-.tab{padding:9px 16px;border-radius:10px;border:0;background:transparent;color:var(--muted);cursor:pointer;font-weight:600;font-size:13px;transition:.2s;font-family:inherit;letter-spacing:-.01em}
+/* ---------- Tabs ---------- */
+.tabs{
+  display:flex;gap:4px;margin-bottom:20px;flex-wrap:wrap;padding:4px;
+  background:var(--panel-2);border-radius:12px;width:fit-content;border:1px solid var(--line);
+}
+.tab{
+  padding:9px 16px;border-radius:9px;border:0;background:transparent;
+  color:var(--muted);cursor:pointer;font-weight:500;font-size:13px;
+  transition:.2s;font-family:inherit;letter-spacing:-.005em;
+}
 .tab:hover{color:var(--text)}
-.tab.active{color:#fff;background:linear-gradient(120deg,var(--accent),var(--accent2));box-shadow:0 6px 18px rgba(224,90,58,.3)}
+.tab.active{
+  color:#050612;background:linear-gradient(120deg,var(--cyan),var(--lime));
+  font-weight:600;box-shadow:var(--glow-cyan);
+}
+body.light .tab.active{color:#fff}
 
+/* ---------- Workspace ---------- */
 .workspace{display:grid;grid-template-columns:1fr 1fr;gap:18px}
-.label{display:block;color:var(--muted);font-size:10.5px;font-weight:700;letter-spacing:1.6px;margin:0 0 8px;text-transform:uppercase}
+.label{
+  display:block;color:var(--muted);font-size:10.5px;font-weight:600;
+  letter-spacing:1.6px;margin:0 0 8px;text-transform:uppercase;
+  font-family:'JetBrains Mono',monospace;
+}
 textarea,input[type=text],input[type=number]{
   width:100%;font:inherit;font-size:14px;color:var(--text);
-  background:var(--panel2);border:1px solid var(--line);border-radius:13px;
+  background:var(--panel-2);border:1px solid var(--line);border-radius:12px;
   padding:13px 15px;outline:none;transition:.2s;font-family:inherit;
 }
 textarea{min-height:170px;resize:vertical;line-height:1.7}
-textarea:focus,input:focus{border-color:var(--accent);box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 16%,transparent);background:var(--panel)}
+textarea:focus,input:focus{
+  border-color:var(--cyan);
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--cyan) 18%,transparent);
+  background:var(--panel-solid);
+}
 textarea[readonly]{cursor:text}
 
 .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
 .result{margin-top:14px}
 .output{
   min-height:96px;white-space:pre-wrap;word-break:break-word;
-  background:var(--panel2);border:1px solid var(--line);border-radius:13px;
+  background:var(--panel-2);border:1px solid var(--line);border-radius:12px;
   padding:14px 15px;font-family:'JetBrains Mono',monospace;
   font-size:12.5px;line-height:1.7;color:var(--text-soft);
 }
 .output-wrap{display:flex;gap:8px;align-items:stretch}
 .output-wrap .output{flex:1;min-width:0}
 .copy-btn{
-  border:1px solid var(--line);background:var(--panel2);color:var(--text-soft);
-  border-radius:13px;padding:0 15px;cursor:pointer;font-weight:600;font-size:12px;
+  border:1px solid var(--line);background:var(--panel-2);color:var(--text-soft);
+  border-radius:12px;padding:0 15px;cursor:pointer;font-weight:500;font-size:12px;
   min-width:80px;transition:.2s;font-family:inherit;
 }
-.copy-btn:hover{border-color:var(--accent);color:var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent)}
+.copy-btn:hover{
+  border-color:var(--cyan);color:var(--cyan);
+  background:color-mix(in srgb,var(--cyan) 8%,transparent);
+}
 
-.notice{padding:13px 16px;border:1px solid var(--line);border-radius:13px;background:var(--panel2);color:var(--text-soft);font-size:13px;line-height:1.65;margin-bottom:18px}
+.notice{
+  padding:13px 16px;border:1px solid var(--line);border-radius:12px;
+  background:var(--panel-2);color:var(--text-soft);
+  font-size:13px;line-height:1.7;margin-bottom:18px;
+}
 .hidden{display:none!important}
 
-button.primary,button.secondary{border:0;border-radius:13px;padding:12px 22px;cursor:pointer;font-weight:600;font-size:14px;transition:.2s ease;font-family:inherit;letter-spacing:-.01em}
-button.primary{color:#fff;background:linear-gradient(120deg,var(--accent),var(--accent2));box-shadow:0 10px 26px rgba(224,90,58,.32)}
-button.primary:hover:not(:disabled){transform:translateY(-2px);box-shadow:0 16px 32px rgba(224,90,58,.42)}
-button.secondary{background:var(--panel2);color:var(--text);border:1px solid var(--line)}
-button.secondary:hover:not(:disabled){border-color:var(--line2);transform:translateY(-2px);background:var(--panel)}
+button.primary,button.secondary{
+  border:0;border-radius:12px;padding:12px 22px;cursor:pointer;
+  font-weight:600;font-size:14px;transition:.2s ease;font-family:inherit;
+  letter-spacing:-.005em;
+}
+button.primary{
+  color:#050612;
+  background:linear-gradient(120deg,var(--cyan),var(--lime));
+  box-shadow:var(--glow-cyan);
+}
+body.light button.primary{color:#fff}
+button.primary:hover:not(:disabled){transform:translateY(-2px);box-shadow:0 0 50px rgba(0,229,255,.5)}
+button.secondary{
+  background:var(--panel-2);color:var(--text);border:1px solid var(--line);
+}
+button.secondary:hover:not(:disabled){
+  border-color:var(--line-strong);transform:translateY(-2px);background:var(--panel-solid);
+}
 button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
 
 .controls3{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin:8px 0 6px}
-.helper,.status{color:var(--muted);font-size:12.5px;line-height:1.65}
+.helper,.status{color:var(--muted);font-size:12.5px;line-height:1.7}
 .status{margin-top:12px;min-height:18px}
 .gen-panel{margin-top:18px}
 
+/* ---------- Blocklist ---------- */
 .bl-form{display:grid;grid-template-columns:1fr 1fr auto auto;gap:12px;align-items:end}
-.bl-field label{display:block;color:var(--muted);font-size:10.5px;font-weight:700;letter-spacing:1.6px;margin:0 0 8px}
-.bl-status{margin-top:16px;color:var(--text-soft);font-size:13px;line-height:1.65}
+.bl-field label{
+  display:block;color:var(--muted);font-size:10.5px;font-weight:600;
+  letter-spacing:1.6px;margin:0 0 8px;text-transform:uppercase;
+  font-family:'JetBrains Mono',monospace;
+}
+.bl-status{margin-top:16px;color:var(--text-soft);font-size:13px;line-height:1.7}
 .bl-health{display:flex;gap:18px;flex-wrap:wrap;margin-top:12px;font-size:12px;color:var(--muted)}
 .bl-health b{color:var(--text);font-weight:600}
-.bl-progress{height:7px;border-radius:99px;background:var(--panel2);overflow:hidden;margin-top:16px;border:1px solid var(--line)}
-.bl-progress-bar{height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--accent2),var(--accent3));transition:width .3s ease}
+.bl-progress{
+  height:6px;border-radius:99px;background:var(--panel-2);
+  overflow:hidden;margin-top:16px;border:1px solid var(--line);
+}
+.bl-progress-bar{
+  height:100%;width:0;
+  background:linear-gradient(90deg,var(--cyan),var(--magenta),var(--lime));
+  transition:width .3s ease;
+}
 
 .bl-summary{display:grid;grid-template-columns:repeat(7,1fr);gap:12px;margin-top:20px}
-.bl-summary-item{padding:18px 12px;border:1px solid var(--line);border-radius:16px;background:var(--panel);text-align:center;box-shadow:var(--shadow)}
-.bl-summary-item b{display:block;font-size:24px;margin-bottom:4px;letter-spacing:-.04em;font-weight:700}
-.bl-summary-item span{color:var(--muted);font-size:10.5px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase}
+.bl-summary-item{
+  padding:18px 12px;border:1px solid var(--line);border-radius:14px;
+  background:var(--panel);text-align:center;box-shadow:var(--shadow);
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+}
+.bl-summary-item b{
+  display:block;font-size:24px;margin-bottom:4px;letter-spacing:-.04em;font-weight:700;
+  background:linear-gradient(120deg,var(--cyan),var(--magenta));
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.bl-summary-item span{
+  color:var(--muted);font-size:10.5px;font-weight:600;
+  letter-spacing:1.2px;text-transform:uppercase;font-family:'JetBrains Mono',monospace;
+}
 
-.bl-table-wrap{margin-top:20px;overflow:auto;border:1px solid var(--line);border-radius:18px;max-height:660px;box-shadow:var(--shadow)}
-.bl-table{width:100%;min-width:1040px;border-collapse:collapse;background:var(--panel)}
-.bl-table thead th{position:sticky;top:0;z-index:2;background:var(--panel2);color:var(--muted);font-size:10.5px;letter-spacing:1.2px;text-transform:uppercase;font-weight:700;padding:14px 12px;border-bottom:1px solid var(--line);text-align:center}
-.bl-table td{padding:11px 12px;border-bottom:1px solid var(--line);font-size:12.5px;text-align:center;vertical-align:middle}
-.bl-table tbody tr:hover td{background:var(--panel2)}
+.bl-table-wrap{
+  margin-top:20px;overflow:auto;border:1px solid var(--line);border-radius:16px;
+  max-height:660px;box-shadow:var(--shadow);
+}
+.bl-table{width:100%;min-width:1040px;border-collapse:collapse;background:var(--panel-solid)}
+.bl-table thead th{
+  position:sticky;top:0;z-index:2;background:var(--panel-2);
+  color:var(--muted);font-size:10.5px;letter-spacing:1.2px;text-transform:uppercase;
+  font-weight:600;padding:14px 12px;border-bottom:1px solid var(--line);
+  text-align:center;font-family:'JetBrains Mono',monospace;
+}
+.bl-table td{
+  padding:11px 12px;border-bottom:1px solid var(--line);
+  font-size:12.5px;text-align:center;vertical-align:middle;
+}
+.bl-table tbody tr:hover td{background:var(--panel-2)}
 .bl-table tbody tr:last-child td{border-bottom:0}
 .ip-cell,.rdns-cell{text-align:left!important;font-family:'JetBrains Mono',monospace;font-size:11.5px!important}
-.bl-status-pill{display:inline-block;padding:3px 10px;border-radius:99px;font-size:10px;font-weight:700;letter-spacing:.4px;border:1px solid transparent}
-.bl-ok{color:var(--ok);background:color-mix(in srgb,var(--ok) 13%,transparent);border-color:color-mix(in srgb,var(--ok) 30%,transparent)}
-.bl-listed{color:var(--danger);background:color-mix(in srgb,var(--danger) 13%,transparent);border-color:color-mix(in srgb,var(--danger) 30%,transparent)}
-.bl-error{color:var(--warn);background:color-mix(in srgb,var(--warn) 15%,transparent);border-color:color-mix(in srgb,var(--warn) 32%,transparent)}
-.bl-na{color:var(--muted);background:var(--panel2);border-color:var(--line)}
-.bl-total td{background:var(--panel2);font-weight:700;border-top:2px solid var(--line2)}
+.bl-status-pill{
+  display:inline-block;padding:3px 10px;border-radius:99px;font-size:10px;
+  font-weight:600;letter-spacing:.4px;border:1px solid transparent;
+  font-family:'JetBrains Mono',monospace;
+}
+.bl-ok{color:var(--ok);background:color-mix(in srgb,var(--ok) 13%,transparent);border-color:color-mix(in srgb,var(--ok) 32%,transparent)}
+.bl-listed{color:var(--danger);background:color-mix(in srgb,var(--danger) 13%,transparent);border-color:color-mix(in srgb,var(--danger) 32%,transparent)}
+.bl-error{color:var(--warn);background:color-mix(in srgb,var(--warn) 15%,transparent);border-color:color-mix(in srgb,var(--warn) 34%,transparent)}
+.bl-na{color:var(--muted);background:var(--panel-2);border-color:var(--line)}
+.bl-total td{background:var(--panel-2);font-weight:700;border-top:2px solid var(--line-strong)}
 .bl-dbl-domain{display:block;margin-top:5px;color:var(--muted);font-size:10.5px;word-break:break-all}
 
-.footer{text-align:center;color:var(--muted);font-size:12px;padding:48px 0 28px;letter-spacing:.02em}
+.footer{
+  text-align:center;color:var(--muted);font-size:12px;
+  padding:48px 0 28px;letter-spacing:.02em;
+}
+.footer .grad{
+  background:linear-gradient(100deg,var(--cyan),var(--magenta));
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+  font-weight:600;
+}
 
+/* ---------- Toasts ---------- */
 .toasts{position:fixed;right:18px;bottom:18px;z-index:100;display:flex;flex-direction:column;gap:10px}
-.toast{padding:13px 18px;border-radius:14px;font-size:13px;font-weight:600;background:var(--panel);border:1px solid var(--line);color:var(--text);box-shadow:var(--shadow-lg);animation:toastIn .3s ease;max-width:340px}
-.toast.ok{border-color:color-mix(in srgb,var(--ok) 45%,transparent)}
-.toast.err{border-color:color-mix(in srgb,var(--danger) 45%,transparent)}
+.toast{
+  padding:13px 18px;border-radius:12px;font-size:13px;font-weight:500;
+  background:var(--panel-solid);border:1px solid var(--line);color:var(--text);
+  box-shadow:var(--shadow-lg);animation:toastIn .3s ease;max-width:340px;
+  backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
+}
+.toast.ok{border-color:color-mix(in srgb,var(--ok) 50%,transparent);color:var(--ok)}
+.toast.err{border-color:color-mix(in srgb,var(--danger) 50%,transparent);color:var(--danger)}
 @keyframes toastIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
 
+/* ---------- Session banner ---------- */
 .session-banner{
   position:fixed;top:14px;left:50%;transform:translateX(-50%);
   z-index:200;padding:9px 16px;border-radius:99px;
-  background:var(--panel);border:1px solid var(--line);color:var(--muted);
-  font-size:12px;font-weight:600;box-shadow:var(--shadow);display:none;
+  background:var(--panel-solid);border:1px solid var(--line);color:var(--muted);
+  font-size:12px;font-weight:500;box-shadow:var(--shadow);display:none;
+  backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
 }
 .session-banner.show{display:block;animation:toastIn .3s ease}
-.session-banner b{color:var(--accent)}
+.session-banner b{
+  background:linear-gradient(100deg,var(--cyan),var(--magenta));
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
 
 @media(max-width:980px){
-  .home-hero{grid-template-columns:1fr;padding:18px 4px 30px;gap:28px}
-  .bento{grid-template-columns:1fr 1fr;grid-template-rows:auto}
-  .bento-card.big,.bento-card.tall,.bento-card.wide{grid-column:auto;grid-row:auto}
-  .bento-card.big{grid-column:1/3}
+  .home-wrap{grid-template-columns:1fr;padding:18px 4px 34px;gap:34px}
+  .feature-grid{grid-template-columns:1fr 1fr}
+  .feat, .feat.wide{grid-column:span 1}
+  .feat.wide{grid-column:span 2}
+  .quick-stats{grid-template-columns:repeat(2,1fr)}
   .workspace,.controls3{grid-template-columns:1fr}
   .bl-form{grid-template-columns:1fr}
   .bl-summary{grid-template-columns:repeat(3,1fr)}
@@ -366,9 +775,9 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
   .topbar{position:static}
   .nav{width:100%}
   .nav button{flex:1 1 auto}
-  .stats-strip{grid-template-columns:repeat(2,1fr)}
-  .bento{grid-template-columns:1fr}
-  .bento-card.big,.bento-card.wide{grid-column:auto}
+  .feature-grid{grid-template-columns:1fr}
+  .feat, .feat.wide{grid-column:auto}
+  .quick-stats{grid-template-columns:repeat(2,1fr)}
   .bl-summary{grid-template-columns:repeat(2,1fr)}
   .output-wrap{flex-direction:column}
   .copy-btn{padding:11px;width:100%}
@@ -376,96 +785,124 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
 </style>
 </head>
 <body>
-<div class="bg-orbs"><span></span><span></span><span></span></div>
-<div id="session-banner" class="session-banner">Session expires in <b id="session-countdown">10:00</b></div>
+<div class="bg-grid"></div>
+<div class="bg-orbs"><span></span><span></span><span></span><span></span></div>
+<div id="session-banner" class="session-banner">Session expires in <b id="session-countdown">60:00</b></div>
 
 <div class="app">
   <header class="topbar">
     <div class="brand" onclick="showPage('home')">
       <svg viewBox="0 0 64 64" aria-hidden="true">
         <defs><linearGradient id="lg" x1="0" x2="1" y1="0" y2="1">
-          <stop stop-color="#e05a3a"/><stop offset=".5" stop-color="#e89b3c"/><stop offset="1" stop-color="#d94a7a"/>
+          <stop stop-color="#00e5ff"/><stop offset=".5" stop-color="#b8ff2b"/><stop offset="1" stop-color="#ff2d95"/>
         </linearGradient></defs>
         <path d="M32 5 55 18v28L32 59 9 46V18z" fill="none" stroke="url(#lg)" stroke-width="3.5" stroke-linejoin="round"/>
-        <text x="32" y="40" text-anchor="middle" font-family="Outfit,sans-serif" font-size="20" font-weight="700" fill="url(#lg)">{U}</text>
+        <text x="32" y="40" text-anchor="middle" font-family="Space Grotesk,sans-serif" font-size="19" font-weight="700" fill="url(#lg)">{U}</text>
       </svg>
-      <div><b>Email journeys</b><span>ENCODE • DECODE • GENERATE</span></div>
+      <div><b>Email journeys</b><span>NEON NEXUS · V4</span></div>
     </div>
     <nav class="nav">
       <button id="nav-home" onclick="showPage('home')">Home</button>
       <button id="nav-converter" onclick="showPage('converter')">Converter</button>
       <button id="nav-generator" onclick="showPage('generator')">Generators</button>
       <button id="nav-blocklist" onclick="showPage('blocklist')">Blocklist</button>
-      <button class="icon-btn" id="theme-btn" onclick="toggleTheme()" title="Toggle theme">☾</button>
+      <button id="nav-hunter" onclick="showPage('hunter')">Email Hunter</button>
+      <button class="icon-btn" id="theme-btn" onclick="toggleTheme()" title="Toggle theme">☀</button>
       <button class="logout" onclick="logoutUser()">Logout</button>
     </nav>
   </header>
 
-  <!-- ================= HOME ================= -->
+  <!-- ================= HOME (NEW LAYOUT) ================= -->
   <section id="home" class="page active">
-    <div class="home-hero">
+    <div class="home-wrap">
       <div class="hero-left">
-        <span class="pill"><span class="dot"></span>Email Toolkit · v2</span>
-        <h1>Every email journey, <span class="swipe">decoded right</span>.</h1>
-        <p class="lede">Encode and decode UTF-8 Q and Base64 subject lines, generate random sender identities, and verify your sending IPs against every major blocklist — one workspace for the people who ship email.</p>
-        <div class="hero-cta">
-          <button class="primary" onclick="showPage('converter');setMode('encode')">Start Encoding</button>
-          <button class="secondary" onclick="showPage('blocklist')">Check Blocklist</button>
-        </div>
-        <div class="micro-stats">
-          <div><b>3</b><span>Q methods</span></div>
-          <div><b>2</b><span>Base64 modes</span></div>
-          <div><b>4</b><span>DNS blocklists</span></div>
-          <div><b>10m</b><span>Session timeout</span></div>
+        <span class="status-chip"><span class="dot"></span>SYSTEM ONLINE · V4</span>
+        <h1 class="hero-title">
+          <span class="line-1">The email ops</span>
+          <span class="line-2">command center.</span>
+        </h1>
+        <p class="hero-desc">
+          One toolkit for everyone who ships email. Encode subject lines, forge identities,
+          audit sending IPs, and hunt down publicly available addresses — all from a single
+          neon-lit workspace. Built for people who care about <code>deliverability</code>,
+          <code>reputation</code>, and <code>speed</code>.
+        </p>
+        <div class="hero-actions">
+          <button class="primary" onclick="showPage('converter');setMode('encode')">Launch Converter</button>
+          <button class="secondary" onclick="showPage('hunter')">Run Email Hunter</button>
         </div>
       </div>
       <div class="hero-right">
-        <div class="preview-window">
-          <div class="window-bar">
+        <div class="terminal">
+          <div class="term-bar">
             <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-            <b>email-journey.live</b>
+            <b>~ email-journeys --live</b>
           </div>
-          <div class="window-body">
-            <div class="win-line"><span class="win-tag tag-in">IN</span><span class="win-text">Your order has shipped 🎉</span></div>
-            <div class="win-line"><span class="win-tag tag-q1">Q1</span><span class="win-text">=?UTF-8?Q?Your_order_has_shipped_=F0=9F=8E=89?=</span></div>
-            <div class="win-line"><span class="win-tag tag-q2">Q2</span><span class="win-text">=?UTF-8?Q?Y=6Eur_=6Frder_has_sh=69pped_=F0=9F=8E=89?=</span></div>
-            <div class="win-line"><span class="win-tag tag-b64">B64</span><span class="win-text">WW91ciBvcmRlciBoYXMgc2hpcHBlZCDwn46J</span></div>
+          <div class="term-body">
+            <div class="term-line"><span class="term-prompt">$</span><span class="term-out">email-toolkit init --nexus</span></div>
+            <div class="term-line"><span class="term-prompt">→</span><span class="term-out cyan">encoder</span><span class="term-out">q1 · q2 · q3 · b64 ready</span></div>
+            <div class="term-line"><span class="term-prompt">→</span><span class="term-out lime">generators</span><span class="term-out">strings · words · names</span></div>
+            <div class="term-line"><span class="term-prompt">→</span><span class="term-out magenta">blocklist</span><span class="term-out">zen · barracuda · dbl</span></div>
+            <div class="term-line"><span class="term-prompt">→</span><span class="term-out cyan">hunter</span><span class="term-out">crawl · extract · dedupe</span></div>
+            <div class="term-line"><span class="term-prompt">$</span><span class="term-out">status</span></div>
+            <div class="term-line"><span class="term-prompt">✓</span><span class="term-out lime">all systems operational</span><span class="term-cursor"></span></div>
           </div>
         </div>
       </div>
     </div>
 
-    <div class="stats-strip">
-      <div><b>99.9%</b><span>Decode accuracy</span></div>
-      <div><b>1024</b><span>IPs per check</span></div>
-      <div><b>24</b><span>Parallel workers</span></div>
-      <div><b>0</b><span>Third-party JS</span></div>
+    <div class="quick-stats">
+      <div class="qs-card"><span class="qs-num">3</span><span class="qs-lbl">Q Encoders</span></div>
+      <div class="qs-card"><span class="qs-num">4</span><span class="qs-lbl">DNSBL Zones</span></div>
+      <div class="qs-card"><span class="qs-num">120s</span><span class="qs-lbl">Hunt Window</span></div>
+      <div class="qs-card"><span class="qs-num">60m</span><span class="qs-lbl">Session</span></div>
     </div>
 
-    <div class="bento">
-      <div class="bento-card big">
-        <div class="bic">✉️</div>
-        <h3>UTF-8 Q Encoding — three flavours</h3>
-        <p>Method&nbsp;1 uses fixed quoted-printable for full safety. Method&nbsp;2 mixes plain and encoded characters. Method&nbsp;3 splits subject lines into random chunks and interleaves Q and Base64 words for maximum obfuscation.</p>
-        <button class="baa" onclick="showPage('converter');setMode('encode')">Open converter</button>
+    <div class="feature-grid">
+      <div class="feat f-cyan" onclick="showPage('converter');setMode('encode')">
+        <div class="feat-glow"></div>
+        <div class="feat-inner">
+          <span class="feat-tag">01 / ENCODE</span>
+          <h3>UTF-8 Q & Base64 Converter</h3>
+          <p>Three Q-encoding methods plus standard and underscore Base64. Every output is one click away from your clipboard.</p>
+          <span class="feat-btn">Open converter <span class="arrow">→</span></span>
+        </div>
       </div>
-      <div class="bento-card tall">
-        <div class="bic">🧬</div>
-        <h3>Smart Decoding</h3>
-        <p>Paste any Q or Base64 encoded-word from a raw email and the app detects the format automatically — then strips invisible formatting characters like ZWSP, ZWNJ and BOM from the result.</p>
-        <button class="baa" onclick="showPage('converter');setMode('decode')">Open decoder</button>
+      <div class="feat f-magenta" onclick="showPage('converter');setMode('decode')">
+        <div class="feat-glow"></div>
+        <div class="feat-inner">
+          <span class="feat-tag">02 / DECODE</span>
+          <h3>Format-Aware Decoder</h3>
+          <p>Paste any Q or Base64 encoded-word. Format is detected automatically, invisible characters are stripped, output is clean.</p>
+          <span class="feat-btn">Open decoder <span class="arrow">→</span></span>
+        </div>
       </div>
-      <div class="bento-card">
-        <div class="bic">🎲</div>
-        <h3>Random Generators</h3>
-        <p>Secure strings, pronounceable words and brandable sender names.</p>
-        <button class="baa" onclick="showPage('generator')">Open generators</button>
+      <div class="feat f-lime" onclick="showPage('generator')">
+        <div class="feat-glow"></div>
+        <div class="feat-inner">
+          <span class="feat-tag">03 / GENERATE</span>
+          <h3>Random Generators</h3>
+          <p>Cryptographically secure strings, pronounceable words, and brandable sender names — all in one panel.</p>
+          <span class="feat-btn">Open generators <span class="arrow">→</span></span>
+        </div>
       </div>
-      <div class="bento-card wide">
-        <div class="bic">🛡️</div>
-        <h3>Bulk Blocklist Check</h3>
-        <p>Query up to 1,024 IPv4 addresses at once against Spamhaus ZEN (CSS / PBL / SBL / XBL) and Barracuda, then resolve RDNS and its registered domain against Spamhaus DBL. Export the whole table to CSV in one click.</p>
-        <button class="baa" onclick="showPage('blocklist')">Open blocklist</button>
+      <div class="feat f-violet" onclick="showPage('blocklist')">
+        <div class="feat-glow"></div>
+        <div class="feat-inner">
+          <span class="feat-tag">04 / AUDIT</span>
+          <h3>Bulk Blocklist Check</h3>
+          <p>Query up to 1,024 IPv4s against Spamhaus ZEN and Barracuda. Resolve RDNS. Test DBL. Export the whole table as CSV.</p>
+          <span class="feat-btn">Open blocklist <span class="arrow">→</span></span>
+        </div>
+      </div>
+      <div class="feat f-cyan wide" onclick="showPage('hunter')">
+        <div class="feat-glow"></div>
+        <div class="feat-inner">
+          <span class="feat-tag">05 / HUNT</span>
+          <h3>Email Hunter — Recursive Crawler</h3>
+          <p>Enter any website URL. The hunter crawls its public internal pages for up to 2 minutes, extracts every publicly available email (plain, <code>mailto:</code>, and obfuscated like <code>name [at] example [dot] com</code>), removes duplicates, and returns a clean list with full crawl statistics. Sitemap-aware, contact-page prioritization, no login bypass, no CAPTCHA bypass — public content only.</p>
+          <span class="feat-btn">Open Email Hunter <span class="arrow">→</span></span>
+        </div>
       </div>
     </div>
   </section>
@@ -473,7 +910,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
   <!-- ================= CONVERTER ================= -->
   <section id="converter" class="page">
     <div class="section-head">
-      <div><h2>UTF-8 &amp; Base64 Converter</h2><p>Switch between Encode and Decode. Format detection on decode is automatic.</p></div>
+      <div><h2>UTF-8 &amp; Base64 <span class="accent">Converter</span></h2><p>Switch between Encode and Decode. Format detection on decode is automatic.</p></div>
     </div>
     <div class="tabs">
       <button id="encode-tab" class="tab active" onclick="setMode('encode')">Encode</button>
@@ -532,7 +969,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
   <!-- ================= GENERATORS ================= -->
   <section id="generator" class="page">
     <div class="section-head">
-      <div><h2>Random Generators</h2><p>Cryptographically strong strings, pronounceable random words, and brandable names.</p></div>
+      <div><h2>Random <span class="accent">Generators</span></h2><p>Cryptographically strong strings, pronounceable random words, and brandable names.</p></div>
     </div>
     <div class="tabs">
       <button id="gen-string-tab" class="tab active" onclick="genTab('string')">String Generator</button>
@@ -597,7 +1034,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
   <section id="blocklist" class="page">
     <div class="section-head">
       <div>
-        <h2>Bulk Blocklist Check</h2>
+        <h2>Bulk <span class="accent">Blocklist Check</span></h2>
         <p>Check an IPv4 range against Spamhaus ZEN (CSS / PBL / SBL / XBL) and Barracuda, then resolve RDNS and test its registered domain against Spamhaus DBL. LISTED means a recognized listing response was found — otherwise the result is N/A.</p>
       </div>
     </div>
@@ -633,22 +1070,56 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
     </div>
   </section>
 
-  <div class="footer">Email journeys · Embedded logo, favicon and BIMI endpoint · <span id="year"></span></div>
+  <!-- ================= EMAIL HUNTER ================= -->
+  <section id="hunter" class="page">
+    <div class="section-head">
+      <div>
+        <h2>Email <span class="accent">Hunter</span></h2>
+        <p>Enter a website URL. We'll crawl its public internal pages for up to 2 minutes, extract every publicly available email (including obfuscated ones), remove duplicates, and show the results.</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <label class="label" for="hunter-url">Website URL</label>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <input id="hunter-url" type="text" placeholder="https://example.com" autocomplete="off" spellcheck="false" style="flex:1;min-width:240px">
+        <button class="primary" id="hunter-btn" onclick="startEmailHunter()">Start Crawl</button>
+        <button class="secondary" id="hunter-cancel" onclick="cancelEmailHunter()" disabled>Cancel</button>
+      </div>
+      <div id="hunter-status" class="status" style="margin-top:14px"></div>
+      <div class="bl-progress hidden" id="hunter-progress" style="margin-top:6px">
+        <div class="bl-progress-bar" id="hunter-progress-bar" style="width:8%"></div>
+      </div>
+    </div>
+
+    <div id="hunter-stats" class="bl-summary hidden" style="margin-top:20px"></div>
+
+    <div class="card" id="hunter-emails-card" style="margin-top:20px;display:none">
+      <h3>Emails Found (<span id="hunter-count">0</span>)</h3>
+      <div class="actions" style="margin-top:0;margin-bottom:12px">
+        <button class="secondary" onclick="copyHunterEmails(this)">Copy All</button>
+        <button class="secondary" onclick="exportHunterCsv()">Export CSV</button>
+      </div>
+      <div id="hunter-emails" class="output" style="min-height:80px;max-height:520px;overflow:auto"></div>
+    </div>
+  </section>
+
+  <div class="footer">Email journeys · <span class="grad">Neon Nexus</span> · Embedded logo, favicon and BIMI endpoint · <span id="year"></span></div>
 </div>
 
 <div id="toasts" class="toasts"></div>
 
 <script>
 const $ = (id) => document.getElementById(id);
-const PAGES = ['home', 'converter', 'generator', 'blocklist'];
+const PAGES = ['home', 'converter', 'generator', 'blocklist', 'hunter'];
 const state = { blAbort: null, blData: null };
 
 /* ============================================================
-   Session timeout — 10 minutes, absolute
+   Session timeout — 1 hour, absolute
    ============================================================ */
-const SESSION_MAX_AGE_MS = 10 * 60 * 1000;
+const SESSION_MAX_AGE_MS = 60 * 60 * 1000;      // ← 1 hour (was 10 min)
 const SESSION_START_KEY = 'ej_session_start';
-const SESSION_BANNER_DELAY_MS = 8 * 60 * 1000; // show banner after 8 min
+const SESSION_BANNER_DELAY_MS = 55 * 60 * 1000; // show banner after 55 min
 
 function sessionStart() {
   let t = parseInt(sessionStorage.getItem(SESSION_START_KEY) || '0', 10);
@@ -675,7 +1146,7 @@ function updateSessionBanner() {
   const elapsed = Date.now() - sessionStart();
   const remaining = Math.max(0, SESSION_MAX_AGE_MS - elapsed);
   if (remaining <= SESSION_MAX_AGE_MS - SESSION_BANNER_DELAY_MS && remaining > 0) {
-    const m = String(Math.floor(remaining / 60000)).padStart(1, '0');
+    const m = String(Math.floor(remaining / 60000)).padStart(2, '0');
     const s = String(Math.floor((remaining % 60000) / 1000)).padStart(2, '0');
     label.textContent = m + ':' + s;
     banner.classList.add('show');
@@ -684,7 +1155,6 @@ function updateSessionBanner() {
   }
 }
 
-// Kick off session tracking
 sessionStart();
 setInterval(function () {
   if (!checkSession()) return;
@@ -720,15 +1190,15 @@ function genTab(mode) {
 }
 
 function toggleTheme() {
-  const dark = document.body.classList.toggle('dark');
-  localStorage.setItem('theme', dark ? 'dark' : 'light');
-  $('theme-btn').textContent = dark ? '☀' : '☾';
+  const light = document.body.classList.toggle('light');
+  localStorage.setItem('theme', light ? 'light' : 'dark');
+  $('theme-btn').textContent = light ? '☾' : '☀';
 }
 (function initTheme() {
   const saved = localStorage.getItem('theme');
-  const dark = saved === 'dark';
-  document.body.classList.toggle('dark', dark);
-  $('theme-btn').textContent = dark ? '☀' : '☾';
+  const light = saved === 'light';
+  document.body.classList.toggle('light', light);
+  $('theme-btn').textContent = light ? '☾' : '☀';
 })();
 
 function logoutUser() {
@@ -800,7 +1270,7 @@ function clearDecode() {
 }
 
 /* ============================================================
-   API helper — handles 401 as "session expired"
+   API helper
    ============================================================ */
 async function api(url, opts) {
   const res = await fetch(url, opts);
@@ -1084,6 +1554,152 @@ function exportBlocklistCsv() {
 }
 
 /* ============================================================
+   Email Hunter
+   ============================================================ */
+const hunterState = { abort: null, sid: null, pollTimer: null, data: null };
+
+async function startEmailHunter() {
+  const url = $('hunter-url').value.trim();
+  if (!url) { toast('Please enter a URL', 'err'); return; }
+
+  const btn = $('hunter-btn');
+  const cancelBtn = $('hunter-cancel');
+  const status = $('hunter-status');
+  const progress = $('hunter-progress');
+  const bar = $('hunter-progress-bar');
+
+  hunterState.abort = new AbortController();
+  hunterState.data = null;
+  btn.disabled = true;
+  btn.textContent = 'Crawling…';
+  cancelBtn.disabled = false;
+  progress.classList.remove('hidden');
+  bar.style.width = '8%';
+  $('hunter-stats').classList.add('hidden');
+  $('hunter-emails-card').style.display = 'none';
+
+  const startedAt = Date.now();
+  const tick = setInterval(function () {
+    const s = ((Date.now() - startedAt) / 1000).toFixed(0);
+    status.textContent = 'Crawling ' + url + '… ' + s + 's (max 120s)';
+    const pct = Math.min(95, 8 + (s / 120) * 87);
+    bar.style.width = pct.toFixed(1) + '%';
+  }, 1000);
+  status.textContent = 'Starting crawl…';
+
+  try {
+    const d = await api('/api/email-hunter/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: url }),
+      signal: hunterState.abort.signal
+    });
+    hunterState.sid = d.session_id;
+    clearInterval(tick);
+    pollHunterResults(startedAt, tick);
+  } catch (e) {
+    clearInterval(tick);
+    finishHunterUi();
+    if (e.name === 'AbortError') { status.textContent = 'Cancelled.'; }
+    else { status.textContent = e.message; toast(e.message, 'err'); }
+  }
+}
+
+function pollHunterResults(startedAt, tick) {
+  const status = $('hunter-status');
+  hunterState.pollTimer = setInterval(async function () {
+    if (!hunterState.sid) return;
+    try {
+      const d = await api('/api/email-hunter/results/' + hunterState.sid, { method: 'GET' });
+      if (d.status === 'running') return;
+      clearInterval(tick);
+      clearInterval(hunterState.pollTimer);
+      hunterState.pollTimer = null;
+
+      if (d.error) {
+        status.textContent = 'Error: ' + d.error;
+        toast(d.error, 'err');
+        finishHunterUi();
+        return;
+      }
+      hunterState.data = d;
+      displayHunterResults(d);
+      finishHunterUi();
+      $('hunter-progress-bar').style.width = '100%';
+      setTimeout(function () { $('hunter-progress').classList.add('hidden'); }, 600);
+    } catch (e) {
+      clearInterval(tick);
+      clearInterval(hunterState.pollTimer);
+      hunterState.pollTimer = null;
+      status.textContent = e.message;
+      finishHunterUi();
+    }
+  }, 1500);
+}
+
+function displayHunterResults(d) {
+  const s = d.stats || {};
+  const stats = $('hunter-stats');
+  const items = [
+    ['Emails',        s.emails || 0],
+    ['Pages',         s.pages_visited || 0],
+    ['Contact Pages', s.contact_pages || 0],
+    ['Discovered',    s.discovered || 0],
+    ['Visited',       s.visited || 0],
+    ['Errors',        s.errors || 0],
+    ['Time (s)',      s.time_taken || 0],
+  ];
+  stats.innerHTML = items.map(function (x) {
+    return '<div class="bl-summary-item"><b>' + esc(x[1]) + '</b><span>' + esc(x[0]) + '</span></div>';
+  }).join('');
+  stats.classList.remove('hidden');
+
+  const emails = d.emails || [];
+  $('hunter-count').textContent = emails.length;
+  $('hunter-emails').textContent = emails.length ? emails.join('\n') : 'No emails found.';
+  $('hunter-emails-card').style.display = 'block';
+
+  $('hunter-status').textContent = 'Done — found ' + emails.length + ' unique email' +
+    (emails.length === 1 ? '' : 's') + ' in ' + (s.time_taken || 0) + 's.';
+}
+
+function finishHunterUi() {
+  const btn = $('hunter-btn');
+  btn.disabled = false;
+  btn.textContent = 'Start Crawl';
+  $('hunter-cancel').disabled = true;
+  hunterState.abort = null;
+}
+
+function cancelEmailHunter() {
+  if (hunterState.pollTimer) { clearInterval(hunterState.pollTimer); hunterState.pollTimer = null; }
+  if (hunterState.abort) hunterState.abort.abort();
+  finishHunterUi();
+  $('hunter-status').textContent = 'Cancelled.';
+  setTimeout(function () { $('hunter-progress').classList.add('hidden'); }, 500);
+}
+
+async function copyHunterEmails(btn) {
+  if (!hunterState.data || !hunterState.data.emails) { toast('Nothing to copy', 'err'); return; }
+  await copyValue(hunterState.data.emails.join('\n'), btn);
+}
+
+function exportHunterCsv() {
+  if (!hunterState.data || !hunterState.data.emails) { toast('Nothing to export', 'err'); return; }
+  const lines = ['Email'].concat(hunterState.data.emails);
+  const blob = new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'emails-despoil.csv';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  toast('CSV exported', 'ok');
+}
+
+/* ============================================================
    Boot
    ============================================================ */
 $('year').textContent = new Date().getFullYear();
@@ -1094,6 +1710,7 @@ document.addEventListener('keydown', function (e) {
     const active = document.activeElement;
     if (active && active.id === 'enc-input') encodeText();
     if (active && active.id === 'dec-input') decodeText();
+    if (active && active.id === 'hunter-url') startEmailHunter();
   }
 });
 </script>
@@ -1117,9 +1734,8 @@ def auth():
             return jsonify(success=False, error="Login required"), 401
         return redirect(url_for("login", next=request.path))
 
-    # Absolute 10-minute timeout
     login_time = session.get("login_time", 0)
-    if time.time() - login_time > SESSION_MAX_AGE:
+    if time.time() - login_time > SESSION_MAX_AGE:   # 1 hour now
         session.clear()
         if request.path.startswith("/api/"):
             return jsonify(success=False, error="Session expired"), 401
@@ -1129,23 +1745,25 @@ def auth():
 LOGIN_HTML = '''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Sign in • Email journeys</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-body{margin:0;min-height:100vh;display:grid;place-items:center;background:#100b0a;color:#f6ede2;font-family:'Outfit',system-ui,-apple-system,'Segoe UI',Roboto,Arial,sans-serif;letter-spacing:-.01em;position:relative;overflow:hidden}
-body::before,body::after{content:'';position:fixed;border-radius:50%;filter:blur(120px);opacity:.4;pointer-events:none}
-body::before{width:520px;height:520px;background:radial-gradient(circle,#e05a3a,transparent 70%);top:-200px;left:-160px}
-body::after{width:480px;height:480px;background:radial-gradient(circle,#d94a7a,transparent 70%);bottom:-200px;right:-160px}
-form{position:relative;z-index:2;width:min(400px,90vw);padding:38px;border:1px solid rgba(255,255,255,.08);border-radius:24px;background:rgba(255,255,255,.04);backdrop-filter:blur(22px);box-shadow:0 34px 80px rgba(0,0,0,.6)}
-h2{margin:0 0 8px;font-size:24px;font-weight:700;letter-spacing:-.02em}
-p{margin:6px 0;color:#a89687;font-size:13.5px}
-input,button{width:100%;padding:14px;margin-top:11px;border-radius:13px;border:1px solid rgba(255,255,255,.09);box-sizing:border-box;font:inherit;font-size:14.5px;font-family:inherit;letter-spacing:-.01em}
-input{background:rgba(255,255,255,.05);color:#fff;outline:none;transition:.2s}
-input:focus{border-color:#e05a3a;box-shadow:0 0 0 4px rgba(224,90,58,.18)}
-button{background:linear-gradient(120deg,#e05a3a,#e89b3c);color:#fff;font-weight:700;cursor:pointer;border:0;margin-top:20px;transition:.2s;box-shadow:0 10px 26px rgba(224,90,58,.35)}
-button:hover{transform:translateY(-2px);box-shadow:0 16px 32px rgba(224,90,58,.45)}
-.e{color:#ff7a8a;margin:10px 0 0;font-size:13px;font-weight:500}
-.n{color:#ffb356;margin:10px 0 0;font-size:13px;font-weight:500}
-</style></head><body><form method="post">
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:#07080f;color:#e9ecf8;font-family:'Space Grotesk',system-ui,-apple-system,'Segoe UI',Roboto,Arial,sans-serif;letter-spacing:-.01em;position:relative;overflow:hidden}
+body::before,body::after{content:'';position:fixed;border-radius:50%;filter:blur(120px);opacity:.45;pointer-events:none}
+body::before{width:520px;height:520px;background:radial-gradient(circle,#00e5ff,transparent 70%);top:-200px;left:-160px}
+body::after{width:480px;height:480px;background:radial-gradient(circle,#ff2d95,transparent 70%);bottom:-200px;right:-160px}
+.bg-grid{position:fixed;inset:0;pointer-events:none;z-index:0;background-image:linear-gradient(rgba(120,140,220,.07) 1px,transparent 1px),linear-gradient(90deg,rgba(120,140,220,.07) 1px,transparent 1px);background-size:44px 44px;mask-image:radial-gradient(ellipse 80% 60% at 50% 40%,#000 40%,transparent 100%);-webkit-mask-image:radial-gradient(ellipse 80% 60% at 50% 40%,#000 40%,transparent 100%)}
+form{position:relative;z-index:2;width:min(400px,90vw);padding:38px;border:1px solid rgba(120,140,220,.18);border-radius:22px;background:rgba(18,22,38,.72);backdrop-filter:blur(22px);box-shadow:0 34px 80px rgba(0,0,0,.7)}
+form::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;border-radius:22px 22px 0 0;background:linear-gradient(90deg,#00e5ff,#ff2d95,#b8ff2b)}
+h2{margin:0 0 8px;font-size:24px;font-weight:700;letter-spacing:-.02em;background:linear-gradient(100deg,#00e5ff,#ff2d95);-webkit-background-clip:text;background-clip:text;color:transparent}
+p{margin:6px 0;color:#8b9bc6;font-size:13.5px}
+input,button{width:100%;padding:14px;margin-top:11px;border-radius:12px;border:1px solid rgba(120,140,220,.18);box-sizing:border-box;font:inherit;font-size:14.5px;font-family:inherit;letter-spacing:-.01em}
+input{background:rgba(24,28,48,.6);color:#fff;outline:none;transition:.2s}
+input:focus{border-color:#00e5ff;box-shadow:0 0 0 3px rgba(0,229,255,.18)}
+button{background:linear-gradient(120deg,#00e5ff,#b8ff2b);color:#050612;font-weight:700;cursor:pointer;border:0;margin-top:20px;transition:.2s;box-shadow:0 10px 26px rgba(0,229,255,.35)}
+button:hover{transform:translateY(-2px);box-shadow:0 16px 32px rgba(0,229,255,.5)}
+.e{color:#ff5c8a;margin:10px 0 0;font-size:13px;font-weight:500}
+.n{color:#ffc247;margin:10px 0 0;font-size:13px;font-weight:500}
+</style></head><body><div class="bg-grid"></div><form method="post">
 <h2>Email journeys</h2>
 <p>Sign in to continue.</p>{{ERR}}{{NOTICE}}
 <input name="username" placeholder="Username" required autofocus autocomplete="username">
@@ -1194,7 +1812,7 @@ def home():
     if not session.get("logged_in"):
         return redirect(url_for("login"))
     login_time = session.get("login_time", 0)
-    if time.time() - login_time > SESSION_MAX_AGE:
+    if time.time() - login_time > SESSION_MAX_AGE:   # 1 hour now
         session.clear()
         return redirect(url_for("login", expired="1"))
     return Response(INDEX_HTML, mimetype="text/html")
@@ -1203,8 +1821,8 @@ def home():
 # ============================================================
 # SVG assets
 # ============================================================
-LOGO_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#100b0a"/><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#e05a3a"/><stop offset=".5" stop-color="#e89b3c"/><stop offset="1" stop-color="#d94a7a"/></linearGradient></defs><path d="M32 6 55 19v26L32 58 9 45V19z" fill="none" stroke="url(#g)" stroke-width="3.5" stroke-linejoin="round"/><text x="32" y="40" text-anchor="middle" font-family="Outfit,sans-serif" font-size="20" font-weight="700" fill="url(#g)">{U}</text></svg>'
-BIMI_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><title>Email journeys</title><rect width="100" height="100" fill="#100b0a"/><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#e05a3a"/><stop offset=".5" stop-color="#e89b3c"/><stop offset="1" stop-color="#d94a7a"/></linearGradient></defs><path d="M50 10 86 31v38L50 90 14 69V31z" fill="none" stroke="url(#g)" stroke-width="4" stroke-linejoin="round"/><text x="50" y="60" text-anchor="middle" font-family="Outfit,sans-serif" font-size="26" font-weight="700" fill="url(#g)">{U}</text></svg>'
+LOGO_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#07080f"/><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#00e5ff"/><stop offset=".5" stop-color="#b8ff2b"/><stop offset="1" stop-color="#ff2d95"/></linearGradient></defs><path d="M32 6 55 19v26L32 58 9 45V19z" fill="none" stroke="url(#g)" stroke-width="3.5" stroke-linejoin="round"/><text x="32" y="40" text-anchor="middle" font-family="Space Grotesk,sans-serif" font-size="19" font-weight="700" fill="url(#g)">{U}</text></svg>'
+BIMI_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><title>Email journeys</title><rect width="100" height="100" fill="#07080f"/><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#00e5ff"/><stop offset=".5" stop-color="#b8ff2b"/><stop offset="1" stop-color="#ff2d95"/></linearGradient></defs><path d="M50 10 86 31v38L50 90 14 69V31z" fill="none" stroke="url(#g)" stroke-width="4" stroke-linejoin="round"/><text x="50" y="60" text-anchor="middle" font-family="Space Grotesk,sans-serif" font-size="26" font-weight="700" fill="url(#g)">{U}</text></svg>'
 
 
 @app.route("/favicon.svg")
@@ -1269,7 +1887,6 @@ def _split_random_chunks(text, count):
     return [text[points[i]:points[i + 1]] for i in range(count)]
 
 def _q3_utf8_word(text):
-    """Q-encode a chunk with randomised quoted-printable substitution."""
     payload = []
     for c in text:
         if c == " ":
@@ -1740,6 +2357,47 @@ def blocklist_check_api():
         else:
             payload["warning"] = "Every query returned an error. Retry in a minute or switch resolver."
     return jsonify(payload)
+
+
+# ============================================================
+# Email Hunter API
+# ============================================================
+@app.post("/api/email-hunter/start")
+def email_hunter_start():
+    if not HAS_HUNTER:
+        return jsonify(error="Email Hunter deps missing. Run: pip install requests beautifulsoup4"), 500
+    data = request.get_json(silent=True) or {}
+    url = str(data.get("url", "")).strip()
+    if not url:
+        return jsonify(error="URL is required"), 400
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    sid = secrets.token_urlsafe(12)
+    _hunter_status[sid] = "running"
+    _hunter_store[sid] = None
+
+    def _run():
+        try:
+            crawler = EmailHunterCrawler(url)
+            result = crawler.crawl()
+            _hunter_store[sid] = result
+            _hunter_status[sid] = "completed"
+        except Exception as e:
+            _hunter_store[sid] = {"error": str(e)}
+            _hunter_status[sid] = "error"
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify(session_id=sid, status="running")
+
+
+@app.get("/api/email-hunter/results/<sid>")
+def email_hunter_results(sid):
+    status = _hunter_status.get(sid, "unknown")
+    if status == "running":
+        return jsonify(status="running")
+    result = _hunter_store.get(sid) or {"error": "No results"}
+    return jsonify(status=status, **result)
 
 
 # ============================================================
