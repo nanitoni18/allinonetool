@@ -8,7 +8,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.exceptions import HTTPException
 from email.header import decode_header
 from datetime import timedelta
-import base64, random, string, secrets, socket, ipaddress, os, threading, time
+import base64, random, string, secrets, socket, ipaddress, os, threading, time, sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Email Hunter deps (optional; app still runs if missing) ---
@@ -50,6 +50,14 @@ SESSION_MAX_AGE = 60 * 60
 
 LOGIN_USERNAME = os.environ.get("LOGIN_USERNAME", "admin")
 LOGIN_PASSWORD_HASH = generate_password_hash(os.environ.get("LOGIN_PASSWORD", "admin"))
+
+
+def _log(msg):
+    """Force-flush print so Render captures hunter activity in real time."""
+    try:
+        print(msg, flush=True)
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -395,21 +403,21 @@ if HAS_HUNTER:
                 if r.status_code == 200 and r.text:
                     if r.encoding and r.encoding.lower() in ("iso-8859-1", "ascii"):
                         r.encoding = r.apparent_encoding or "utf-8"
-                    app.logger.info("HUNTER OK (requests) %s len=%d", url, len(r.text))
+                    _log(f"[HUNTER OK-requests] {r.status_code} len={len(r.text)} {url}")
                     return r.text
                 self.stats["status_codes"][str(r.status_code)] = \
                     self.stats["status_codes"].get(str(r.status_code), 0) + 1
-                app.logger.info("HUNTER STATUS %s -> %s", r.status_code, url)
+                _log(f"[HUNTER STATUS] {r.status_code} {url}")
                 if r.status_code in (403, 429, 503) and _retry < 1:
                     time.sleep(1.2)
             except requests.exceptions.SSLError as e:
-                app.logger.warning("HUNTER SSL ERROR %s: %s", url, e)
+                _log(f"[HUNTER SSL-ERR] {url} :: {e}")
             except requests.exceptions.Timeout:
-                app.logger.warning("HUNTER TIMEOUT %s", url)
+                _log(f"[HUNTER TIMEOUT] {url}")
             except requests.exceptions.ConnectionError as e:
-                app.logger.warning("HUNTER CONN ERROR %s: %s", url, e)
+                _log(f"[HUNTER CONN-ERR] {url} :: {e}")
             except Exception as e:
-                app.logger.warning("HUNTER REQ ERROR %s: %s: %s", url, type(e).__name__, e)
+                _log(f"[HUNTER REQ-ERR] {url} :: {type(e).__name__}: {e}")
 
             # 2) cloudscraper (Cloudflare)
             if self.scraper is not None:
@@ -419,14 +427,14 @@ if HAS_HUNTER:
                     if r.status_code == 200 and r.text:
                         if r.encoding and r.encoding.lower() in ("iso-8859-1", "ascii"):
                             r.encoding = r.apparent_encoding or "utf-8"
-                        app.logger.info("HUNTER OK (cloudscraper) %s len=%d", url, len(r.text))
+                        _log(f"[HUNTER OK-cloudscraper] {r.status_code} len={len(r.text)} {url}")
                         return r.text
-                    app.logger.info("HUNTER CS STATUS %s -> %s", r.status_code, url)
+                    _log(f"[HUNTER CS-STATUS] {r.status_code} {url}")
                 except Exception as e:
-                    app.logger.warning("HUNTER CS ERROR %s: %s", url, e)
+                    _log(f"[HUNTER CS-ERR] {url} :: {type(e).__name__}: {e}")
 
             self.stats["errors"] += 1
-            app.logger.warning("HUNTER FAIL %s", url)
+            _log(f"[HUNTER FAIL] {url}")
             return None
 
         def _discover_sitemaps(self):
@@ -469,12 +477,13 @@ if HAS_HUNTER:
 
         def _discover_subdomains(self):
             found = set()
+            _log(f"[HUNTER SUBS] probing wordlist for {self.base_domain}...")
 
             def _check(sub):
                 host = f"{sub}.{self.base_domain}"
                 try:
-                    socket.gethostbyname(host)
-                    return host
+                    ip = socket.gethostbyname(host)
+                    return (host, ip)
                 except Exception:
                     return None
 
@@ -483,13 +492,15 @@ if HAS_HUNTER:
                     futures = {ex.submit(_check, s): s for s in HUNTER_SUBDOMAIN_WORDLIST}
                     for fut in as_completed(futures):
                         try:
-                            h = fut.result()
-                            if h:
-                                found.add(h)
+                            res = fut.result()
+                            if res:
+                                host, ip = res
+                                found.add(host)
+                                _log(f"[HUNTER SUB-HIT] {host} -> {ip}")
                         except Exception:
                             pass
-            except Exception:
-                pass
+            except Exception as e:
+                _log(f"[HUNTER SUBS-ERR] wordlist: {e}")
 
             try:
                 r = self.session.get(
@@ -504,8 +515,9 @@ if HAS_HUNTER:
                             n = n.strip().lower().lstrip("*.").rstrip(".")
                             if n.endswith("." + self.base_domain) and "*" not in n:
                                 found.add(n)
+                    _log(f"[HUNTER SUBS] crt.sh added (total now {len(found)})")
             except Exception as e:
-                app.logger.info("crt.sh skip: %s", e)
+                _log(f"[HUNTER SUBS] crt.sh skip: {e}")
 
             return found
 
@@ -534,6 +546,10 @@ if HAS_HUNTER:
             self.start_time = time.time()
             self.queue.append(self.start_url)
 
+            _log("=" * 60)
+            _log(f"[HUNTER START] {self.start_url} (base={self.base_domain})")
+            _log("=" * 60)
+
             for sm in self._discover_sitemaps():
                 for u in self._parse_sitemap(sm):
                     if self._is_internal(u) and u not in self.visited:
@@ -548,7 +564,8 @@ if HAS_HUNTER:
 
             try:
                 subs = self._discover_subdomains()
-            except Exception:
+            except Exception as e:
+                _log(f"[HUNTER SUBS-ERR] {e}")
                 subs = set()
 
             self.subdomains_live = set(subs)
@@ -558,8 +575,7 @@ if HAS_HUNTER:
             for host in crawl_subs:
                 self._seed_host(host)
 
-            app.logger.info("HUNTER START domain=%s subs_found=%d subs_crawling=%d",
-                            self.base_domain, len(subs), len(crawl_subs))
+            _log(f"[HUNTER QUEUE] subs_found={len(subs)} subs_crawling={len(crawl_subs)} discovered={self.stats['discovered']}")
 
             while self.queue and (time.time() - self.start_time) < HUNTER_MAX_TIME:
                 self._prioritize()
@@ -580,7 +596,10 @@ if HAS_HUNTER:
                 if self._is_contact(url):
                     self.stats["contact_pages"] += 1
 
-                self.emails.update(hunter_extract_emails(html))
+                emails_here = hunter_extract_emails(html)
+                if emails_here:
+                    _log(f"[HUNTER EMAILS] {len(emails_here)} on {url}")
+                self.emails.update(emails_here)
 
                 try:
                     soup = BeautifulSoup(html, "html.parser")
@@ -593,9 +612,28 @@ if HAS_HUNTER:
                         e = href[7:].split("?")[0].strip().lower()
                         if _is_valid_email(e):
                             self.emails.add(e)
+                            _log(f"[HUNTER MAILTO] {e}")
 
                 new_links = self._extract_links(soup, url)
                 self._enqueue_many(new_links)
+
+            # --- DEBUG SUMMARY ---
+            _log("=" * 60)
+            _log(f"[HUNTER SUMMARY] domain={self.base_domain}")
+            _log(f"  pages_visited   = {self.stats['pages_visited']}")
+            _log(f"  contact_pages   = {self.stats['contact_pages']}")
+            _log(f"  subdomains_found= {self.stats['subdomains_found']}")
+            _log(f"  subdomains_live = {sorted(self.subdomains_live)}")
+            _log(f"  subdomains_visited = {self.stats['subdomains_visited']}")
+            _log(f"  status_codes    = {self.stats.get('status_codes', {})}")
+            _log(f"  errors          = {self.stats['errors']}")
+            _log(f"  discovered      = {self.stats['discovered']}")
+            _log(f"  visited         = {self.stats['visited']}")
+            _log(f"  emails_found    = {len(self.emails)}")
+            if self.emails:
+                _log(f"  emails          = {sorted(self.emails)}")
+            _log(f"  time_taken      = {round(time.time() - self.start_time, 2)}s")
+            _log("=" * 60)
 
             self.stats["emails"] = len(self.emails)
             self.stats["time_taken"] = round(time.time() - self.start_time, 2)
@@ -800,7 +838,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
         <path d="M32 5 55 18v28L32 59 9 46V18z" fill="none" stroke="url(#lg)" stroke-width="3.5" stroke-linejoin="round"/>
         <text x="32" y="40" text-anchor="middle" font-family="Space Grotesk,sans-serif" font-size="19" font-weight="700" fill="url(#lg)">{U}</text>
       </svg>
-      <div><b>Email journeys</b><span>NEON NEXUS · V6</span></div>
+      <div><b>Email journeys</b><span>NEON NEXUS · V7</span></div>
     </div>
     <nav class="nav">
       <button id="nav-home" onclick="showPage('home')">Home</button>
@@ -1341,7 +1379,9 @@ function displayHunterResults(d) {
   $('hunter-count').textContent = emails.length;
   $('hunter-emails').textContent = emails.length ? emails.join('\n') : 'No emails found.';
   $('hunter-emails-card').style.display = 'block';
-  $('hunter-status').textContent = 'Done — ' + emails.length + ' email' + (emails.length === 1 ? '' : 's') + ', ' + subs.length + ' subdomain' + (subs.length === 1 ? '' : 's') + ' in ' + (s.time_taken || 0) + 's.';
+  const codes = s.status_codes || {};
+  const codesStr = Object.keys(codes).length ? ' HTTP: ' + Object.entries(codes).map(([k,v]) => k + '×' + v).join(', ') : '';
+  $('hunter-status').textContent = 'Done — ' + emails.length + ' email' + (emails.length === 1 ? '' : 's') + ', ' + subs.length + ' subdomain' + (subs.length === 1 ? '' : 's') + ' in ' + (s.time_taken || 0) + 's.' + codesStr;
 }
 function finishHunterUi() {
   const btn = $('hunter-btn');
@@ -2028,6 +2068,7 @@ def email_hunter_start():
             _hunter_store[sid] = result
             _hunter_status[sid] = "completed"
         except Exception as e:
+            _log(f"[HUNTER EXCEPTION] {type(e).__name__}: {e}")
             app.logger.exception("Hunter failed: %s", e)
             _hunter_store[sid] = {"error": str(e)}
             _hunter_status[sid] = "error"
