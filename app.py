@@ -1,7 +1,6 @@
 # ============================================================
-# Email journeys — Single-file Flask App (Cloud Light Edition)
-# Includes: Converter, Generators, Blocklist, Email Hunter
-# Session: 1 hour  |  Theme: Cloud Light (clean & decent)
+# Email journeys — Single-file Flask App (Cloud Light + Night)
+# Multi-URL Email Hunter · Theme Toggle · Session 1 hour
 # ============================================================
 from flask import Flask, request, jsonify, session, redirect, url_for, Response
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -11,7 +10,6 @@ from datetime import timedelta
 import base64, random, string, secrets, socket, ipaddress, os, threading, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# --- Email Hunter deps (optional; app still runs if missing) ---
 try:
     import requests
     from bs4 import BeautifulSoup
@@ -38,9 +36,6 @@ LOGIN_USERNAME = os.environ.get("LOGIN_USERNAME", "admin")
 LOGIN_PASSWORD_HASH = generate_password_hash(os.environ.get("LOGIN_PASSWORD", "admin"))
 
 
-# ============================================================
-# Error handler
-# ============================================================
 @app.errorhandler(Exception)
 def _handle_any_error(e):
     if request.path.startswith("/api/"):
@@ -55,7 +50,7 @@ def _handle_any_error(e):
 
 
 # ============================================================
-# Email Hunter — crawler + extractor
+# Email Hunter — multi-domain crawler
 # ============================================================
 if HAS_HUNTER:
     HUNTER_MAX_TIME = 120
@@ -104,21 +99,37 @@ if HAS_HUNTER:
         return found
 
     class EmailHunterCrawler:
-        def __init__(self, start_url):
-            self.start_url = start_url.rstrip("/")
-            self.domain = urlparse(start_url).netloc
+        """Crawls one or more start URLs within a shared 2-minute budget."""
+
+        def __init__(self, start_urls):
+            if isinstance(start_urls, str):
+                start_urls = [start_urls]
+            self.start_urls = [u.rstrip("/") for u in start_urls if u and u.strip()]
+            self.domains = set()
+            for u in self.start_urls:
+                netloc = urlparse(u).netloc.lower()
+                if netloc:
+                    self.domains.add(netloc)
+                    # Accept www and non-www interchangeably
+                    if netloc.startswith("www."):
+                        self.domains.add(netloc[4:])
+                    else:
+                        self.domains.add("www." + netloc)
             self.visited = set()
             self.queue = _deque_h()
             self.emails = set()
+            self.emails_by_domain = {}
             self.stats = {
                 "pages_visited": 0, "contact_pages": 0,
                 "errors": 0, "discovered": 0, "visited": 0,
+                "sites": len(self.start_urls),
             }
             self.start_time = None
 
         def _is_internal(self, url):
             p = urlparse(url)
-            return p.netloc == self.domain or p.netloc == ""
+            netloc = p.netloc.lower()
+            return netloc in self.domains or netloc == ""
 
         def _normalize(self, base, link):
             try:
@@ -163,11 +174,11 @@ if HAS_HUNTER:
                 self.stats["errors"] += 1
                 return None
 
-        def _discover_sitemaps(self):
+        def _discover_sitemaps(self, base_url):
             sitemaps = []
             try:
                 r = requests.get(
-                    f"{self.start_url}/robots.txt",
+                    f"{base_url}/robots.txt",
                     headers={"User-Agent": HUNTER_UA}, timeout=10,
                 )
                 if r.status_code == 200:
@@ -177,7 +188,7 @@ if HAS_HUNTER:
             except Exception:
                 pass
             for path in ["/sitemap.xml", "/sitemap", "/site-map", "/sitemap_index.xml"]:
-                sitemaps.append(urljoin(self.start_url, path))
+                sitemaps.append(urljoin(base_url, path))
             return list(set(sitemaps))
 
         def _parse_sitemap(self, sm_url):
@@ -202,12 +213,15 @@ if HAS_HUNTER:
 
         def crawl(self):
             self.start_time = time.time()
-            self.queue.append(self.start_url)
 
-            for sm in self._discover_sitemaps():
-                for u in self._parse_sitemap(sm):
-                    if self._is_internal(u) and u not in self.visited:
-                        self.queue.append(u)
+            # Seed all start URLs + their sitemaps
+            for u in self.start_urls:
+                self.queue.append(u)
+            for u in self.start_urls:
+                for sm in self._discover_sitemaps(u):
+                    for s in self._parse_sitemap(sm):
+                        if self._is_internal(s) and s not in self.visited:
+                            self.queue.append(s)
 
             while self.queue and (time.time() - self.start_time) < HUNTER_MAX_TIME:
                 self._prioritize()
@@ -225,7 +239,13 @@ if HAS_HUNTER:
                 if self._is_contact(url):
                     self.stats["contact_pages"] += 1
 
-                self.emails.update(hunter_extract_emails(html))
+                found = hunter_extract_emails(html)
+                self.emails.update(found)
+
+                # Track which domain each email came from
+                host = urlparse(url).netloc.lower()
+                if host:
+                    self.emails_by_domain.setdefault(host, set()).update(found)
 
                 try:
                     soup = BeautifulSoup(html, "html.parser")
@@ -238,6 +258,8 @@ if HAS_HUNTER:
                         e = href[7:].split("?")[0].strip().lower()
                         if _is_valid_email(e):
                             self.emails.add(e)
+                            if host:
+                                self.emails_by_domain.setdefault(host, set()).add(e)
 
                 for link in self._extract_links(soup, url):
                     if link not in self.visited and link not in self.queue:
@@ -246,14 +268,20 @@ if HAS_HUNTER:
 
             self.stats["emails"] = len(self.emails)
             self.stats["time_taken"] = round(time.time() - self.start_time, 2)
-            return {"emails": sorted(self.emails), "stats": self.stats}
+            # Serialize per-domain breakdown
+            by_domain = {d: sorted(list(s)) for d, s in self.emails_by_domain.items()}
+            return {
+                "emails": sorted(self.emails),
+                "emails_by_domain": by_domain,
+                "stats": self.stats,
+            }
 
     _hunter_store = {}
     _hunter_status = {}
 
 
 # ============================================================
-# INDEX_HTML — Cloud Light Theme
+# INDEX_HTML — Cloud Light + Night mode
 # ============================================================
 INDEX_HTML = r"""<!doctype html>
 <html lang="en">
@@ -261,7 +289,6 @@ INDEX_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Email journeys — Cloud Light</title>
-<meta name="description" content="Email journey toolkit — encoder, generators, blocklist checks and email hunter.">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -279,6 +306,7 @@ INDEX_HTML = r"""<!doctype html>
   --line:#e2e8f0;
   --line-strong:#cbd5e0;
   --accent:#0d9488;
+  --accent-hover:#0f766e;
   --accent-2:#f59e0b;
   --accent-3:#8b5cf6;
   --ok:#059669;
@@ -286,6 +314,30 @@ INDEX_HTML = r"""<!doctype html>
   --danger:#dc2626;
   --shadow:0 1px 3px rgba(15,23,42,.06),0 8px 24px rgba(15,23,42,.06);
   --shadow-lg:0 4px 12px rgba(15,23,42,.08),0 20px 48px rgba(15,23,42,.10);
+  --terminal-bg:#ffffff;
+  --terminal-bar:#f4f6fa;
+}
+body.dark{
+  --bg:#0f1419;
+  --bg-soft:#1a2028;
+  --panel:#161b22;
+  --panel-2:#1c232b;
+  --text:#e6edf3;
+  --text-soft:#b3bec9;
+  --muted:#7d8590;
+  --line:#2d3540;
+  --line-strong:#3d4754;
+  --accent:#14b8a6;
+  --accent-hover:#0d9488;
+  --accent-2:#f59e0b;
+  --accent-3:#a78bfa;
+  --ok:#34d399;
+  --warn:#fbbf24;
+  --danger:#f87171;
+  --shadow:0 1px 3px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35);
+  --shadow-lg:0 4px 12px rgba(0,0,0,.5),0 20px 48px rgba(0,0,0,.55);
+  --terminal-bg:#0d1117;
+  --terminal-bar:#161b22;
 }
 
 *,*::before,*::after{box-sizing:border-box}
@@ -298,26 +350,32 @@ body{
   -webkit-font-smoothing:antialiased;
   letter-spacing:-0.005em;
   overflow-x:hidden;
+  transition:background .3s ease, color .3s ease;
 }
 code,pre,.mono,.output{font-family:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 
-/* Soft background — no orbs, no grid, just subtle gradients */
 .bg-soft{
   position:fixed;inset:0;z-index:0;pointer-events:none;
   background:
     radial-gradient(circle at 15% 0%, rgba(13,148,136,.06) 0%, transparent 45%),
     radial-gradient(circle at 85% 20%, rgba(139,92,246,.05) 0%, transparent 45%),
     radial-gradient(circle at 50% 100%, rgba(245,158,11,.05) 0%, transparent 50%);
+  transition:opacity .3s ease;
+}
+body.dark .bg-soft{
+  background:
+    radial-gradient(circle at 15% 0%, rgba(20,184,166,.08) 0%, transparent 45%),
+    radial-gradient(circle at 85% 20%, rgba(167,139,250,.06) 0%, transparent 45%),
+    radial-gradient(circle at 50% 100%, rgba(245,158,11,.04) 0%, transparent 50%);
 }
 
 .app{position:relative;z-index:1;max-width:1280px;margin:0 auto;padding:22px 22px 0}
 
-/* ---------- Top bar ---------- */
 .topbar{
   position:sticky;top:12px;z-index:40;
   display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;
   padding:12px 16px;margin:0 0 30px;
-  background:rgba(255,255,255,.85);
+  background:color-mix(in srgb,var(--panel) 85%,transparent);
   backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
   border:1px solid var(--line);border-radius:16px;
   box-shadow:var(--shadow);
@@ -335,10 +393,14 @@ code,pre,.mono,.output{font-family:'JetBrains Mono',ui-monospace,SFMono-Regular,
 .nav button:hover{color:var(--text);background:var(--panel-2);border-color:var(--line)}
 .nav button.active{
   color:#fff;background:var(--accent);
-  box-shadow:0 4px 14px rgba(13,148,136,.30);
+  box-shadow:0 4px 14px color-mix(in srgb,var(--accent) 30%,transparent);
   font-weight:600;
 }
-.nav .icon-btn{padding:9px 13px;font-size:15px;background:var(--panel-2);border:1px solid var(--line)}
+.nav .icon-btn{
+  padding:9px 13px;font-size:16px;background:var(--panel-2);
+  border:1px solid var(--line);line-height:1;
+}
+.nav .icon-btn:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
 .nav .logout{
   background:transparent;border:1px solid color-mix(in srgb,var(--danger) 30%,transparent);
   color:var(--danger);font-weight:500;
@@ -349,11 +411,7 @@ code,pre,.mono,.output{font-family:'JetBrains Mono',ui-monospace,SFMono-Regular,
 .page.active{display:block}
 @keyframes fade{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
 
-/* ---------- HOME ---------- */
-.home-wrap{
-  display:grid;grid-template-columns:1.1fr .9fr;gap:44px;align-items:center;
-  padding:26px 6px 52px;
-}
+.home-wrap{display:grid;grid-template-columns:1.1fr .9fr;gap:44px;align-items:center;padding:26px 6px 52px}
 .hero-left{max-width:600px}
 .status-chip{
   display:inline-flex;align-items:center;gap:9px;
@@ -364,42 +422,27 @@ code,pre,.mono,.output{font-family:'JetBrains Mono',ui-monospace,SFMono-Regular,
 }
 .status-chip .dot{width:7px;height:7px;border-radius:50%;background:var(--accent);animation:pulse 1.8s ease-in-out infinite}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.85)}}
-
-.hero-title{
-  font-size:clamp(40px,5.2vw,66px);line-height:1.02;margin:24px 0 22px;
-  letter-spacing:-.035em;font-weight:700;color:var(--text);
-}
+.hero-title{font-size:clamp(40px,5.2vw,66px);line-height:1.02;margin:24px 0 22px;letter-spacing:-.035em;font-weight:700;color:var(--text)}
 .hero-title .line-2{
   display:block;
   background:linear-gradient(100deg,var(--accent) 0%,var(--accent-3) 60%,var(--accent-2) 100%);
-  -webkit-background-clip:text;background-clip:text;color:transparent;
-  font-weight:800;
+  -webkit-background-clip:text;background-clip:text;color:transparent;font-weight:800;
 }
-
-.hero-desc{
-  color:var(--text-soft);font-size:16px;line-height:1.75;margin:0 0 30px;max-width:540px;
-}
+.hero-desc{color:var(--text-soft);font-size:16px;line-height:1.75;margin:0 0 30px;max-width:540px}
 .hero-desc code{
-  background:color-mix(in srgb,var(--accent) 8%,transparent);
-  color:var(--accent);padding:2px 7px;border-radius:6px;
-  font-size:13px;font-family:'JetBrains Mono',monospace;
+  background:color-mix(in srgb,var(--accent) 8%,transparent);color:var(--accent);
+  padding:2px 7px;border-radius:6px;font-size:13px;font-family:'JetBrains Mono',monospace;
   border:1px solid color-mix(in srgb,var(--accent) 18%,transparent);
 }
-
 .hero-actions{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:34px}
 
-/* Terminal preview — light version */
 .terminal{
-  background:#ffffff;
-  border:1px solid var(--line);
-  border-radius:14px;overflow:hidden;
-  box-shadow:var(--shadow-lg);
+  background:var(--terminal-bg);border:1px solid var(--line);
+  border-radius:14px;overflow:hidden;box-shadow:var(--shadow-lg);
   font-family:'JetBrains Mono',monospace;
+  transition:background .3s ease, border-color .3s ease;
 }
-.term-bar{
-  display:flex;align-items:center;gap:8px;padding:11px 14px;
-  background:var(--panel-2);border-bottom:1px solid var(--line);
-}
+.term-bar{display:flex;align-items:center;gap:8px;padding:11px 14px;background:var(--terminal-bar);border-bottom:1px solid var(--line)}
 .term-bar .dot{width:10px;height:10px;border-radius:50%}
 .term-bar .dot.r{background:#ff5f57}
 .term-bar .dot.y{background:#ffbd2e}
@@ -415,177 +458,81 @@ code,pre,.mono,.output{font-family:'JetBrains Mono',ui-monospace,SFMono-Regular,
 .term-cursor{display:inline-block;width:8px;height:14px;background:var(--accent);margin-left:4px;animation:blink 1s steps(1) infinite;vertical-align:middle}
 @keyframes blink{50%{opacity:0}}
 
-/* Quick stats */
-.quick-stats{
-  display:grid;grid-template-columns:repeat(4,1fr);gap:14px;
-  margin-bottom:52px;
-}
-.qs-card{
-  padding:22px 20px;border-radius:16px;
-  background:var(--panel);border:1px solid var(--line);
-  box-shadow:var(--shadow);
-  position:relative;overflow:hidden;
-  transition:.3s ease;
-}
-.qs-card::before{
-  content:'';position:absolute;top:0;left:0;right:0;height:3px;
-  background:linear-gradient(90deg,var(--accent),var(--accent-3),var(--accent-2));
-}
+.quick-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:52px}
+.qs-card{padding:22px 20px;border-radius:16px;background:var(--panel);border:1px solid var(--line);box-shadow:var(--shadow);position:relative;overflow:hidden;transition:.3s ease}
+.qs-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--accent),var(--accent-3),var(--accent-2))}
 .qs-card:hover{transform:translateY(-3px);box-shadow:var(--shadow-lg)}
-.qs-num{
-  display:block;font-size:30px;font-weight:700;letter-spacing:-.03em;line-height:1;margin-bottom:8px;
-  color:var(--accent);
-}
+.qs-num{display:block;font-size:30px;font-weight:700;letter-spacing:-.03em;line-height:1;margin-bottom:8px;color:var(--accent)}
 .qs-lbl{font-size:11px;color:var(--muted);letter-spacing:.12em;text-transform:uppercase;font-weight:600}
 
-/* Feature grid */
-.feature-grid{
-  display:grid;grid-template-columns:repeat(6,1fr);gap:18px;margin-bottom:32px;
-}
+.feature-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:18px;margin-bottom:32px}
 .feat{
-  grid-column:span 3;
-  padding:28px;border-radius:18px;
-  background:var(--panel);border:1px solid var(--line);
-  box-shadow:var(--shadow);
-  position:relative;overflow:hidden;
-  transition:.3s ease;
-  cursor:pointer;
+  grid-column:span 3;padding:28px;border-radius:18px;
+  background:var(--panel);border:1px solid var(--line);box-shadow:var(--shadow);
+  position:relative;overflow:hidden;transition:.3s ease;cursor:pointer;
 }
-.feat:hover{
-  transform:translateY(-3px);
-  box-shadow:var(--shadow-lg);
-  border-color:color-mix(in srgb,var(--accent) 30%,transparent);
-}
+.feat:hover{transform:translateY(-3px);box-shadow:var(--shadow-lg);border-color:color-mix(in srgb,var(--accent) 30%,transparent)}
 .feat.f-cyan{--accent-color:var(--accent)}
 .feat.f-magenta{--accent-color:var(--accent-3)}
 .feat.f-lime{--accent-color:var(--ok)}
 .feat.f-violet{--accent-color:var(--accent-2)}
 .feat-tag{
-  display:inline-block;
-  font-size:10px;font-weight:600;letter-spacing:.14em;
-  padding:3px 9px;border-radius:6px;
-  color:var(--accent-color);
+  display:inline-block;font-size:10px;font-weight:600;letter-spacing:.14em;
+  padding:3px 9px;border-radius:6px;color:var(--accent-color);
   background:color-mix(in srgb,var(--accent-color) 10%,transparent);
   border:1px solid color-mix(in srgb,var(--accent-color) 22%,transparent);
-  margin-bottom:16px;
-  text-transform:uppercase;
-  font-family:'JetBrains Mono',monospace;
+  margin-bottom:16px;text-transform:uppercase;font-family:'JetBrains Mono',monospace;
 }
 .feat h3{margin:0 0 10px;font-size:19px;font-weight:700;letter-spacing:-.02em;line-height:1.3;color:var(--text)}
 .feat p{color:var(--text-soft);font-size:13.5px;line-height:1.7;margin:0}
-.feat p code{
-  background:var(--panel-2);color:var(--accent);
-  padding:1px 6px;border-radius:5px;font-size:12px;
-  border:1px solid var(--line);
-}
-.feat-btn{
-  display:inline-flex;align-items:center;gap:8px;margin-top:20px;
-  font-size:13px;font-weight:600;color:var(--accent-color);cursor:pointer;
-  border:0;background:transparent;padding:0;font-family:inherit;
-  transition:.25s ease;
-}
+.feat p code{background:var(--panel-2);color:var(--accent);padding:1px 6px;border-radius:5px;font-size:12px;border:1px solid var(--line)}
+.feat-btn{display:inline-flex;align-items:center;gap:8px;margin-top:20px;font-size:13px;font-weight:600;color:var(--accent-color);cursor:pointer;border:0;background:transparent;padding:0;font-family:inherit;transition:.25s ease}
 .feat-btn:hover{gap:12px}
 .feat-btn .arrow{transition:.25s ease}
 .feat-btn:hover .arrow{transform:translateX(3px)}
 .feat.wide{grid-column:span 6}
 
-/* ---------- Section head ---------- */
 .section-head{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;margin:4px 0 22px;flex-wrap:wrap}
 .section-head h2{margin:0;font-size:26px;letter-spacing:-.03em;font-weight:700;color:var(--text)}
 .section-head h2 .accent{color:var(--accent)}
 .section-head p{margin:6px 0 0;color:var(--muted);font-size:13.5px;line-height:1.7;max-width:760px}
 
-/* ---------- Cards ---------- */
-.card{
-  background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
-  padding:24px;box-shadow:var(--shadow);
-}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:24px;box-shadow:var(--shadow)}
 .card h3{margin:0 0 16px;font-size:16px;font-weight:700;letter-spacing:-.01em;color:var(--text)}
 
-/* ---------- Tabs ---------- */
-.tabs{
-  display:flex;gap:4px;margin-bottom:20px;flex-wrap:wrap;padding:4px;
-  background:var(--panel-2);border-radius:12px;width:fit-content;border:1px solid var(--line);
-}
-.tab{
-  padding:9px 16px;border-radius:9px;border:0;background:transparent;
-  color:var(--muted);cursor:pointer;font-weight:500;font-size:13px;
-  transition:.2s;font-family:inherit;
-}
+.tabs{display:flex;gap:4px;margin-bottom:20px;flex-wrap:wrap;padding:4px;background:var(--panel-2);border-radius:12px;width:fit-content;border:1px solid var(--line)}
+.tab{padding:9px 16px;border-radius:9px;border:0;background:transparent;color:var(--muted);cursor:pointer;font-weight:500;font-size:13px;transition:.2s;font-family:inherit}
 .tab:hover{color:var(--text)}
-.tab.active{
-  color:#fff;background:var(--accent);
-  font-weight:600;box-shadow:0 2px 8px rgba(13,148,136,.25);
-}
+.tab.active{color:#fff;background:var(--accent);font-weight:600;box-shadow:0 2px 8px color-mix(in srgb,var(--accent) 25%,transparent)}
 
-/* ---------- Workspace ---------- */
 .workspace{display:grid;grid-template-columns:1fr 1fr;gap:18px}
-.label{
-  display:block;color:var(--muted);font-size:10.5px;font-weight:600;
-  letter-spacing:1.4px;margin:0 0 8px;text-transform:uppercase;
-  font-family:'JetBrains Mono',monospace;
-}
+.label{display:block;color:var(--muted);font-size:10.5px;font-weight:600;letter-spacing:1.4px;margin:0 0 8px;text-transform:uppercase;font-family:'JetBrains Mono',monospace}
 textarea,input[type=text],input[type=number]{
   width:100%;font:inherit;font-size:14px;color:var(--text);
   background:var(--panel-2);border:1px solid var(--line);border-radius:12px;
   padding:13px 15px;outline:none;transition:.2s;font-family:inherit;
 }
 textarea{min-height:170px;resize:vertical;line-height:1.7}
-textarea:focus,input:focus{
-  border-color:var(--accent);
-  box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 15%,transparent);
-  background:var(--panel);
-}
+textarea:focus,input:focus{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 15%,transparent);background:var(--panel)}
 textarea[readonly]{cursor:text}
+textarea::placeholder, input::placeholder{color:var(--muted)}
 
 .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
 .result{margin-top:14px}
-.output{
-  min-height:96px;white-space:pre-wrap;word-break:break-word;
-  background:var(--panel-2);border:1px solid var(--line);border-radius:12px;
-  padding:14px 15px;font-family:'JetBrains Mono',monospace;
-  font-size:12.5px;line-height:1.7;color:var(--text-soft);
-}
+.output{min-height:96px;white-space:pre-wrap;word-break:break-word;background:var(--panel-2);border:1px solid var(--line);border-radius:12px;padding:14px 15px;font-family:'JetBrains Mono',monospace;font-size:12.5px;line-height:1.7;color:var(--text-soft)}
 .output-wrap{display:flex;gap:8px;align-items:stretch}
 .output-wrap .output{flex:1;min-width:0}
-.copy-btn{
-  border:1px solid var(--line);background:var(--panel);color:var(--text-soft);
-  border-radius:12px;padding:0 15px;cursor:pointer;font-weight:500;font-size:12px;
-  min-width:80px;transition:.2s;font-family:inherit;
-}
-.copy-btn:hover{
-  border-color:var(--accent);color:var(--accent);
-  background:color-mix(in srgb,var(--accent) 6%,transparent);
-}
+.copy-btn{border:1px solid var(--line);background:var(--panel);color:var(--text-soft);border-radius:12px;padding:0 15px;cursor:pointer;font-weight:500;font-size:12px;min-width:80px;transition:.2s;font-family:inherit}
+.copy-btn:hover{border-color:var(--accent);color:var(--accent);background:color-mix(in srgb,var(--accent) 6%,transparent)}
 
-.notice{
-  padding:13px 16px;border:1px solid var(--line);border-radius:12px;
-  background:var(--panel-2);color:var(--text-soft);
-  font-size:13px;line-height:1.7;margin-bottom:18px;
-}
+.notice{padding:13px 16px;border:1px solid var(--line);border-radius:12px;background:var(--panel-2);color:var(--text-soft);font-size:13px;line-height:1.7;margin-bottom:18px}
 .hidden{display:none!important}
 
-button.primary,button.secondary{
-  border:0;border-radius:12px;padding:12px 22px;cursor:pointer;
-  font-weight:600;font-size:14px;transition:.2s ease;font-family:inherit;
-  letter-spacing:-.005em;
-}
-button.primary{
-  color:#fff;background:var(--accent);
-  box-shadow:0 4px 14px rgba(13,148,136,.25);
-}
-button.primary:hover:not(:disabled){
-  transform:translateY(-2px);
-  background:#0f766e;
-  box-shadow:0 8px 20px rgba(13,148,136,.35);
-}
-button.secondary{
-  background:var(--panel);color:var(--text);border:1px solid var(--line);
-}
-button.secondary:hover:not(:disabled){
-  border-color:var(--line-strong);transform:translateY(-2px);
-  background:var(--panel-2);
-}
+button.primary,button.secondary{border:0;border-radius:12px;padding:12px 22px;cursor:pointer;font-weight:600;font-size:14px;transition:.2s ease;font-family:inherit;letter-spacing:-.005em}
+button.primary{color:#fff;background:var(--accent);box-shadow:0 4px 14px color-mix(in srgb,var(--accent) 25%,transparent)}
+button.primary:hover:not(:disabled){transform:translateY(-2px);background:var(--accent-hover);box-shadow:0 8px 20px color-mix(in srgb,var(--accent) 35%,transparent)}
+button.secondary{background:var(--panel);color:var(--text);border:1px solid var(--line)}
+button.secondary:hover:not(:disabled){border-color:var(--line-strong);transform:translateY(-2px);background:var(--panel-2)}
 button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
 
 .controls3{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin:8px 0 6px}
@@ -593,64 +540,27 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
 .status{margin-top:12px;min-height:18px}
 .gen-panel{margin-top:18px}
 
-/* ---------- Blocklist ---------- */
 .bl-form{display:grid;grid-template-columns:1fr 1fr auto auto;gap:12px;align-items:end}
-.bl-field label{
-  display:block;color:var(--muted);font-size:10.5px;font-weight:600;
-  letter-spacing:1.4px;margin:0 0 8px;text-transform:uppercase;
-  font-family:'JetBrains Mono',monospace;
-}
+.bl-field label{display:block;color:var(--muted);font-size:10.5px;font-weight:600;letter-spacing:1.4px;margin:0 0 8px;text-transform:uppercase;font-family:'JetBrains Mono',monospace}
 .bl-status{margin-top:16px;color:var(--text-soft);font-size:13px;line-height:1.7}
 .bl-health{display:flex;gap:18px;flex-wrap:wrap;margin-top:12px;font-size:12px;color:var(--muted)}
 .bl-health b{color:var(--text);font-weight:600}
-.bl-progress{
-  height:6px;border-radius:99px;background:var(--panel-2);
-  overflow:hidden;margin-top:16px;border:1px solid var(--line);
-}
-.bl-progress-bar{
-  height:100%;width:0;
-  background:linear-gradient(90deg,var(--accent),var(--accent-3));
-  transition:width .3s ease;
-}
+.bl-progress{height:6px;border-radius:99px;background:var(--panel-2);overflow:hidden;margin-top:16px;border:1px solid var(--line)}
+.bl-progress-bar{height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--accent-3));transition:width .3s ease}
 
 .bl-summary{display:grid;grid-template-columns:repeat(7,1fr);gap:12px;margin-top:20px}
-.bl-summary-item{
-  padding:18px 12px;border:1px solid var(--line);border-radius:14px;
-  background:var(--panel);text-align:center;box-shadow:var(--shadow);
-}
-.bl-summary-item b{
-  display:block;font-size:24px;margin-bottom:4px;letter-spacing:-.03em;font-weight:700;
-  color:var(--accent);
-}
-.bl-summary-item span{
-  color:var(--muted);font-size:10.5px;font-weight:600;
-  letter-spacing:1.1px;text-transform:uppercase;
-  font-family:'JetBrains Mono',monospace;
-}
+.bl-summary-item{padding:18px 12px;border:1px solid var(--line);border-radius:14px;background:var(--panel);text-align:center;box-shadow:var(--shadow)}
+.bl-summary-item b{display:block;font-size:24px;margin-bottom:4px;letter-spacing:-.03em;font-weight:700;color:var(--accent)}
+.bl-summary-item span{color:var(--muted);font-size:10.5px;font-weight:600;letter-spacing:1.1px;text-transform:uppercase;font-family:'JetBrains Mono',monospace}
 
-.bl-table-wrap{
-  margin-top:20px;overflow:auto;border:1px solid var(--line);border-radius:14px;
-  max-height:660px;box-shadow:var(--shadow);
-}
+.bl-table-wrap{margin-top:20px;overflow:auto;border:1px solid var(--line);border-radius:14px;max-height:660px;box-shadow:var(--shadow)}
 .bl-table{width:100%;min-width:1040px;border-collapse:collapse;background:var(--panel)}
-.bl-table thead th{
-  position:sticky;top:0;z-index:2;background:var(--panel-2);
-  color:var(--muted);font-size:10.5px;letter-spacing:1.1px;text-transform:uppercase;
-  font-weight:600;padding:14px 12px;border-bottom:1px solid var(--line);
-  text-align:center;font-family:'JetBrains Mono',monospace;
-}
-.bl-table td{
-  padding:11px 12px;border-bottom:1px solid var(--line);
-  font-size:12.5px;text-align:center;vertical-align:middle;
-}
+.bl-table thead th{position:sticky;top:0;z-index:2;background:var(--panel-2);color:var(--muted);font-size:10.5px;letter-spacing:1.1px;text-transform:uppercase;font-weight:600;padding:14px 12px;border-bottom:1px solid var(--line);text-align:center;font-family:'JetBrains Mono',monospace}
+.bl-table td{padding:11px 12px;border-bottom:1px solid var(--line);font-size:12.5px;text-align:center;vertical-align:middle}
 .bl-table tbody tr:hover td{background:var(--panel-2)}
 .bl-table tbody tr:last-child td{border-bottom:0}
 .ip-cell,.rdns-cell{text-align:left!important;font-family:'JetBrains Mono',monospace;font-size:11.5px!important}
-.bl-status-pill{
-  display:inline-block;padding:3px 10px;border-radius:99px;font-size:10px;
-  font-weight:600;letter-spacing:.4px;border:1px solid transparent;
-  font-family:'JetBrains Mono',monospace;
-}
+.bl-status-pill{display:inline-block;padding:3px 10px;border-radius:99px;font-size:10px;font-weight:600;letter-spacing:.4px;border:1px solid transparent;font-family:'JetBrains Mono',monospace}
 .bl-ok{color:var(--ok);background:color-mix(in srgb,var(--ok) 10%,transparent);border-color:color-mix(in srgb,var(--ok) 28%,transparent)}
 .bl-listed{color:var(--danger);background:color-mix(in srgb,var(--danger) 10%,transparent);border-color:color-mix(in srgb,var(--danger) 28%,transparent)}
 .bl-error{color:var(--warn);background:color-mix(in srgb,var(--warn) 12%,transparent);border-color:color-mix(in srgb,var(--warn) 30%,transparent)}
@@ -658,24 +568,41 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
 .bl-total td{background:var(--panel-2);font-weight:700;border-top:2px solid var(--line-strong)}
 .bl-dbl-domain{display:block;margin-top:5px;color:var(--muted);font-size:10.5px;word-break:break-all}
 
-.footer{
-  text-align:center;color:var(--muted);font-size:12px;
-  padding:48px 0 28px;letter-spacing:.02em;
+/* Email Hunter multi-URL box */
+.hunter-box textarea{
+  min-height:130px;font-family:'JetBrains Mono',monospace;font-size:13px;line-height:1.75;
 }
+.hunter-meta{margin-top:8px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;font-size:12px;color:var(--muted)}
+.hunter-meta b{color:var(--accent);font-family:'JetBrains Mono',monospace}
+.domain-block{
+  margin-top:14px;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:var(--panel);
+}
+.domain-block-header{
+  padding:10px 14px;background:var(--panel-2);border-bottom:1px solid var(--line);
+  font-size:12.5px;font-weight:600;color:var(--text);
+  display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;
+  font-family:'JetBrains Mono',monospace;
+}
+.domain-block-header .count{
+  background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--accent);
+  padding:2px 9px;border-radius:99px;font-size:11px;font-weight:700;
+  border:1px solid color-mix(in srgb,var(--accent) 22%,transparent);
+}
+.domain-block-body{
+  padding:12px 14px;font-family:'JetBrains Mono',monospace;font-size:12.5px;
+  line-height:1.75;color:var(--text-soft);max-height:280px;overflow:auto;
+  white-space:pre-wrap;word-break:break-all;
+}
+
+.footer{text-align:center;color:var(--muted);font-size:12px;padding:48px 0 28px;letter-spacing:.02em}
 .footer .grad{color:var(--accent);font-weight:600}
 
-/* ---------- Toasts ---------- */
 .toasts{position:fixed;right:18px;bottom:18px;z-index:100;display:flex;flex-direction:column;gap:10px}
-.toast{
-  padding:13px 18px;border-radius:12px;font-size:13px;font-weight:500;
-  background:var(--panel);border:1px solid var(--line);color:var(--text);
-  box-shadow:var(--shadow-lg);animation:toastIn .3s ease;max-width:340px;
-}
+.toast{padding:13px 18px;border-radius:12px;font-size:13px;font-weight:500;background:var(--panel);border:1px solid var(--line);color:var(--text);box-shadow:var(--shadow-lg);animation:toastIn .3s ease;max-width:340px}
 .toast.ok{border-color:color-mix(in srgb,var(--ok) 40%,transparent);color:var(--ok);background:color-mix(in srgb,var(--ok) 6%,var(--panel))}
 .toast.err{border-color:color-mix(in srgb,var(--danger) 40%,transparent);color:var(--danger);background:color-mix(in srgb,var(--danger) 6%,var(--panel))}
 @keyframes toastIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
 
-/* ---------- Session banner ---------- */
 .session-banner{
   position:fixed;top:14px;left:50%;transform:translateX(-50%);
   z-index:200;padding:9px 16px;border-radius:99px;
@@ -725,7 +652,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
         <circle cx="44" cy="44" r="7" fill="#ffffff"/>
         <path d="M41 44l2 2 4-4" stroke="#0d9488" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
-      <div><b>Email journeys</b><span>CLOUD LIGHT · V4</span></div>
+      <div><b>Email journeys</b><span>CLOUD LIGHT · V5</span></div>
     </div>
     <nav class="nav">
       <button id="nav-home" onclick="showPage('home')">Home</button>
@@ -733,6 +660,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
       <button id="nav-generator" onclick="showPage('generator')">Generators</button>
       <button id="nav-blocklist" onclick="showPage('blocklist')">Blocklist</button>
       <button id="nav-hunter" onclick="showPage('hunter')">Email Hunter</button>
+      <button class="icon-btn" id="theme-btn" onclick="toggleTheme()" title="Toggle night mode">🌙</button>
       <button class="logout" onclick="logoutUser()">Logout</button>
     </nav>
   </header>
@@ -741,16 +669,16 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
   <section id="home" class="page active">
     <div class="home-wrap">
       <div class="hero-left">
-        <span class="status-chip"><span class="dot"></span>SYSTEM ONLINE · V4</span>
+        <span class="status-chip"><span class="dot"></span>SYSTEM ONLINE · V5</span>
         <h1 class="hero-title">
           The email ops
           <span class="line-2">command center.</span>
         </h1>
         <p class="hero-desc">
           One toolkit for everyone who ships email. Encode subject lines, forge identities,
-          audit sending IPs, and hunt down publicly available addresses — all from one
-          clean workspace. Built for people who care about <code>deliverability</code>,
-          <code>reputation</code>, and <code>speed</code>.
+          audit sending IPs, and hunt down publicly available addresses — across
+          <code>multiple domains at once</code>. Built for people who care about
+          <code>deliverability</code>, <code>reputation</code>, and <code>speed</code>.
         </p>
         <div class="hero-actions">
           <button class="primary" onclick="showPage('converter');setMode('encode')">Launch Converter</button>
@@ -768,7 +696,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
             <div class="term-line"><span class="term-prompt">→</span><span class="term-out cyan">encoder</span><span class="term-out">q1 · q2 · q3 · b64 ready</span></div>
             <div class="term-line"><span class="term-prompt">→</span><span class="term-out lime">generators</span><span class="term-out">strings · words · names</span></div>
             <div class="term-line"><span class="term-prompt">→</span><span class="term-out magenta">blocklist</span><span class="term-out">zen · barracuda · dbl</span></div>
-            <div class="term-line"><span class="term-prompt">→</span><span class="term-out cyan">hunter</span><span class="term-out">crawl · extract · dedupe</span></div>
+            <div class="term-line"><span class="term-prompt">→</span><span class="term-out cyan">hunter</span><span class="term-out">multi-domain crawl</span></div>
             <div class="term-line"><span class="term-prompt">$</span><span class="term-out">status</span></div>
             <div class="term-line"><span class="term-prompt">✓</span><span class="term-out lime">all systems operational</span><span class="term-cursor"></span></div>
           </div>
@@ -780,7 +708,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
       <div class="qs-card"><span class="qs-num">3</span><span class="qs-lbl">Q Encoders</span></div>
       <div class="qs-card"><span class="qs-num">4</span><span class="qs-lbl">DNSBL Zones</span></div>
       <div class="qs-card"><span class="qs-num">120s</span><span class="qs-lbl">Hunt Window</span></div>
-      <div class="qs-card"><span class="qs-num">60m</span><span class="qs-lbl">Session</span></div>
+      <div class="qs-card"><span class="qs-num">∞</span><span class="qs-lbl">Multi-Domain</span></div>
     </div>
 
     <div class="feature-grid">
@@ -818,9 +746,9 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
       </div>
       <div class="feat f-cyan wide" onclick="showPage('hunter')">
         <div class="feat-inner">
-          <span class="feat-tag">05 / HUNT</span>
-          <h3>Email Hunter — Recursive Crawler</h3>
-          <p>Enter any website URL. The hunter crawls its public internal pages for up to 2 minutes, extracts every publicly available email (plain, <code>mailto:</code>, and obfuscated like <code>name [at] example [dot] com</code>), removes duplicates, and returns a clean list with full crawl statistics. Sitemap-aware, contact-page prioritization, no login bypass, no CAPTCHA bypass — public content only.</p>
+          <span class="feat-tag">05 / HUNT · MULTI-DOMAIN</span>
+          <h3>Email Hunter — Recursive Multi-Site Crawler</h3>
+          <p>Enter <strong>one or many website URLs</strong> (one per line). The hunter crawls all of them within a shared 2-minute budget, extracts every publicly available email (plain, <code>mailto:</code>, and obfuscated like <code>name [at] example [dot] com</code>), removes duplicates, groups results by domain, and returns full crawl statistics. Sitemap-aware, contact-page prioritization, no login bypass — public content only.</p>
           <span class="feat-btn">Open Email Hunter <span class="arrow">→</span></span>
         </div>
       </div>
@@ -955,7 +883,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
     <div class="section-head">
       <div>
         <h2>Bulk <span class="accent">Blocklist Check</span></h2>
-        <p>Check an IPv4 range against Spamhaus ZEN (CSS / PBL / SBL / XBL) and Barracuda, then resolve RDNS and test its registered domain against Spamhaus DBL. LISTED means a recognized listing response was found — otherwise the result is N/A.</p>
+        <p>Check an IPv4 range against Spamhaus ZEN (CSS / PBL / SBL / XBL) and Barracuda, then resolve RDNS and test its registered domain against Spamhaus DBL.</p>
       </div>
     </div>
 
@@ -990,21 +918,26 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
     </div>
   </section>
 
-  <!-- ================= EMAIL HUNTER ================= -->
+  <!-- ================= EMAIL HUNTER (multi-URL) ================= -->
   <section id="hunter" class="page">
     <div class="section-head">
       <div>
-        <h2>Email <span class="accent">Hunter</span></h2>
-        <p>Enter a website URL. We'll crawl its public internal pages for up to 2 minutes, extract every publicly available email (including obfuscated ones), remove duplicates, and show the results.</p>
+        <h2>Email <span class="accent">Hunter</span> — Multi-Domain</h2>
+        <p>Enter one or many website URLs (one per line). All domains are crawled with the same algorithm within a shared 2-minute budget, results are de-duplicated and grouped by domain.</p>
       </div>
     </div>
 
-    <div class="card">
-      <label class="label" for="hunter-url">Website URL</label>
-      <div style="display:flex;gap:10px;flex-wrap:wrap">
-        <input id="hunter-url" type="text" placeholder="https://example.com" autocomplete="off" spellcheck="false" style="flex:1;min-width:240px">
+    <div class="card hunter-box">
+      <label class="label" for="hunter-urls">Website URLs — one per line</label>
+      <textarea id="hunter-urls" spellcheck="false" placeholder="https://example.com&#10;https://another-site.com&#10;bistum-augsburg.de"></textarea>
+      <div class="hunter-meta">
+        <span>Detected domains: <b id="hunter-count-domains">0</b></span>
+        <span>Total budget: <b>120s</b> shared</span>
+      </div>
+      <div class="actions" style="margin-top:14px">
         <button class="primary" id="hunter-btn" onclick="startEmailHunter()">Start Crawl</button>
         <button class="secondary" id="hunter-cancel" onclick="cancelEmailHunter()" disabled>Cancel</button>
+        <button class="secondary" onclick="clearHunterInput()">Clear</button>
       </div>
       <div id="hunter-status" class="status" style="margin-top:14px"></div>
       <div class="bl-progress hidden" id="hunter-progress" style="margin-top:6px">
@@ -1015,12 +948,15 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
     <div id="hunter-stats" class="bl-summary hidden" style="margin-top:20px"></div>
 
     <div class="card" id="hunter-emails-card" style="margin-top:20px;display:none">
-      <h3>Emails Found (<span id="hunter-count">0</span>)</h3>
-      <div class="actions" style="margin-top:0;margin-bottom:12px">
-        <button class="secondary" onclick="copyHunterEmails(this)">Copy All</button>
-        <button class="secondary" onclick="exportHunterCsv()">Export CSV</button>
-      </div>
+      <h3 style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+        <span>Emails Found (<span id="hunter-count">0</span>)</span>
+        <span class="actions" style="margin:0">
+          <button class="secondary" onclick="copyHunterEmails(this)">Copy All</button>
+          <button class="secondary" onclick="exportHunterCsv()">Export CSV</button>
+        </span>
+      </h3>
       <div id="hunter-emails" class="output" style="min-height:80px;max-height:520px;overflow:auto"></div>
+      <div id="hunter-by-domain" style="margin-top:16px"></div>
     </div>
   </section>
 
@@ -1034,7 +970,30 @@ const $ = (id) => document.getElementById(id);
 const PAGES = ['home', 'converter', 'generator', 'blocklist', 'hunter'];
 const state = { blAbort: null, blData: null };
 
-/* Session — 1 hour */
+/* ============================================================
+   THEME TOGGLE (light ↔ night)
+   ============================================================ */
+const THEME_KEY = 'ej_theme';
+function applyTheme(theme) {
+  const isDark = theme === 'dark';
+  document.body.classList.toggle('dark', isDark);
+  const btn = $('theme-btn');
+  if (btn) btn.textContent = isDark ? '☀️' : '🌙';
+  if (btn) btn.title = isDark ? 'Switch to light mode' : 'Switch to night mode';
+}
+function toggleTheme() {
+  const isDark = document.body.classList.toggle('dark');
+  localStorage.setItem(THEME_KEY, isDark ? 'dark' : 'light');
+  applyTheme(isDark ? 'dark' : 'light');
+}
+(function initTheme() {
+  const saved = localStorage.getItem(THEME_KEY) || 'light';
+  applyTheme(saved);
+})();
+
+/* ============================================================
+   Session — 1 hour
+   ============================================================ */
 const SESSION_MAX_AGE_MS = 60 * 60 * 1000;
 const SESSION_START_KEY = 'ej_session_start';
 const SESSION_BANNER_DELAY_MS = 55 * 60 * 1000;
@@ -1047,7 +1006,6 @@ function sessionStart() {
   }
   return t;
 }
-
 function checkSession() {
   const elapsed = Date.now() - sessionStart();
   if (elapsed >= SESSION_MAX_AGE_MS) {
@@ -1057,7 +1015,6 @@ function checkSession() {
   }
   return true;
 }
-
 function updateSessionBanner() {
   const banner = $('session-banner');
   const label = $('session-countdown');
@@ -1072,13 +1029,15 @@ function updateSessionBanner() {
     banner.classList.remove('show');
   }
 }
-
 sessionStart();
 setInterval(function () {
   if (!checkSession()) return;
   updateSessionBanner();
 }, 1000);
 
+/* ============================================================
+   Navigation
+   ============================================================ */
 function showPage(name) {
   if (!checkSession()) return;
   PAGES.forEach((p) => $(p).classList.toggle('active', p === name));
@@ -1088,7 +1047,6 @@ function showPage(name) {
   window.scrollTo({ top: 0, behavior: 'smooth' });
   if (name === 'blocklist') refreshHealth();
 }
-
 function setMode(mode) {
   showPage('converter');
   $('encode-panel').classList.toggle('hidden', mode !== 'encode');
@@ -1096,19 +1054,20 @@ function setMode(mode) {
   $('encode-tab').classList.toggle('active', mode === 'encode');
   $('decode-tab').classList.toggle('active', mode === 'decode');
 }
-
 function genTab(mode) {
   ['string', 'word', 'name'].forEach((x) => {
     $('gen-' + x).classList.toggle('hidden', x !== mode);
     $('gen-' + x + '-tab').classList.toggle('active', x === mode);
   });
 }
-
 function logoutUser() {
   sessionStorage.removeItem(SESSION_START_KEY);
   window.location.href = '/logout';
 }
 
+/* ============================================================
+   Toasts + clipboard
+   ============================================================ */
 function toast(message, kind) {
   const el = document.createElement('div');
   el.className = 'toast ' + (kind || '');
@@ -1121,7 +1080,6 @@ function toast(message, kind) {
     setTimeout(() => el.remove(), 260);
   }, 2600);
 }
-
 function legacyCopy(value) {
   const ta = document.createElement('textarea');
   ta.value = value;
@@ -1135,7 +1093,6 @@ function legacyCopy(value) {
   document.execCommand('copy');
   document.body.removeChild(ta);
 }
-
 async function writeClipboard(value) {
   if (navigator.clipboard && window.isSecureContext) {
     await navigator.clipboard.writeText(value);
@@ -1143,7 +1100,6 @@ async function writeClipboard(value) {
   }
   legacyCopy(value);
 }
-
 async function copyValue(value, btn) {
   if (!value) { toast('Nothing to copy', 'err'); return; }
   try {
@@ -1158,7 +1114,6 @@ async function copyValue(value, btn) {
     toast('Clipboard access failed', 'err');
   }
 }
-
 function copyText(id, btn) { copyValue($(id).textContent, btn); }
 function copyArea(id, btn) { copyValue($(id).value, btn); }
 function clearBox(id) { $(id).value = ''; }
@@ -1169,6 +1124,9 @@ function clearDecode() {
   $('detected').textContent = '';
 }
 
+/* ============================================================
+   API helper
+   ============================================================ */
 async function api(url, opts) {
   const res = await fetch(url, opts);
   if (res.status === 401) {
@@ -1187,6 +1145,9 @@ async function api(url, opts) {
   return data;
 }
 
+/* ============================================================
+   Converter
+   ============================================================ */
 async function encodeText() {
   const text = $('enc-input').value;
   if (!text) {
@@ -1207,7 +1168,6 @@ async function encodeText() {
     $('b64u').textContent = d.base64_underscore;
   } catch (e) { toast(e.message, 'err'); }
 }
-
 async function decodeText() {
   const value = $('dec-input').value.trim();
   if (!value) { toast('Enter encoded text first', 'err'); return; }
@@ -1226,12 +1186,14 @@ async function decodeText() {
   }
 }
 
+/* ============================================================
+   Generators
+   ============================================================ */
 function readRange(a, b) {
   let x = Math.max(1, Math.min(parseInt($(a).value, 10) || 1, 10000));
   let y = Math.max(1, Math.min(parseInt($(b).value, 10) || 20, 10000));
   return x > y ? [y, x] : [x, y];
 }
-
 async function generateStrings() {
   const range = readRange('stringMin', 'stringMax');
   const count = Math.max(1, Math.min(parseInt($('stringCount').value, 10) || 10, 100));
@@ -1245,7 +1207,6 @@ async function generateStrings() {
     $('stringStatus').textContent = d.results.length + ' strings generated';
   } catch (e) { $('stringStatus').textContent = e.message; toast(e.message, 'err'); }
 }
-
 async function generateWords() {
   const range = readRange('wordMin', 'wordMax');
   const count = Math.max(1, Math.min(parseInt($('wordCount').value, 10) || 10, 1000));
@@ -1259,7 +1220,6 @@ async function generateWords() {
     $('wordStatus').textContent = d.results.length + ' random words generated';
   } catch (e) { $('wordStatus').textContent = e.message; toast(e.message, 'err'); }
 }
-
 async function generateNames() {
   const count = Math.max(1, Math.min(parseInt($('nameCount').value, 10) || 10, 1000));
   try {
@@ -1273,12 +1233,14 @@ async function generateNames() {
   } catch (e) { $('nameStatus').textContent = e.message; toast(e.message, 'err'); }
 }
 
+/* ============================================================
+   Blocklist
+   ============================================================ */
 function esc(v) {
   return String(v === null || v === undefined ? '' : v).replace(/[&<>"']/g, function (c) {
     return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
   });
 }
-
 function pill(v) {
   const s = String(v || 'N/A').toUpperCase();
   if (s === 'LISTED') return '<span class="bl-status-pill bl-listed">LISTED</span>';
@@ -1286,7 +1248,6 @@ function pill(v) {
   if (s === 'ERROR') return '<span class="bl-status-pill bl-error">ERROR</span>';
   return '<span class="bl-status-pill bl-na">N/A</span>';
 }
-
 async function refreshHealth() {
   try {
     const d = await api('/api/blocklist/health', { method: 'GET' });
@@ -1301,7 +1262,6 @@ async function refreshHealth() {
     $('bl-health').textContent = 'Health check failed: ' + e.message;
   }
 }
-
 function renderSummary(t) {
   const items = [
     ['Total', t.total], ['CSS', t.css], ['PBL', t.pbl], ['SBL', t.sbl],
@@ -1312,7 +1272,6 @@ function renderSummary(t) {
   }).join('');
   $('bl-summary').classList.remove('hidden');
 }
-
 function renderResults(rows, totals) {
   const body = rows.map(function (r) {
     const domain = (r.dbl_domain && r.dbl_domain !== '-')
@@ -1329,7 +1288,6 @@ function renderResults(rows, totals) {
       '<td>' + pill(r.dbl) + domain + '</td>' +
       '</tr>';
   }).join('');
-
   const totalRow = '<tr class="bl-total">' +
     '<td class="ip-cell">Total</td>' +
     '<td>' + esc(totals.css) + '</td>' +
@@ -1339,11 +1297,9 @@ function renderResults(rows, totals) {
     '<td>' + esc(totals.rdns) + '</td>' +
     '<td>' + esc(totals.dbl) + '</td>' +
     '</tr>';
-
   $('bl-tbody').innerHTML = body + totalRow;
   $('bl-results').classList.remove('hidden');
 }
-
 async function checkBlocklist() {
   const first = $('bl-first-ip').value.trim();
   const last = $('bl-last-ip').value.trim();
@@ -1352,20 +1308,17 @@ async function checkBlocklist() {
   const status = $('bl-status');
   const progress = $('bl-progress');
   const bar = $('bl-progress-bar');
-
   if (!first || !last) {
     status.textContent = 'Enter both the First IP address and the Last IP address.';
     toast('Both IP fields are required', 'err');
     return;
   }
-
   state.blAbort = new AbortController();
   const startedAt = Date.now();
   const tick = setInterval(function () {
     status.textContent = 'Checking ' + first + ' → ' + last + '… ' +
       ((Date.now() - startedAt) / 1000).toFixed(0) + 's';
   }, 1000);
-
   btn.disabled = true;
   btn.textContent = 'Checking…';
   cancelBtn.disabled = false;
@@ -1376,7 +1329,6 @@ async function checkBlocklist() {
   $('bl-summary').classList.add('hidden');
   $('bl-export-wrap').style.display = 'none';
   state.blData = null;
-
   try {
     const d = await api('/api/blocklist/check', {
       method: 'POST',
@@ -1389,7 +1341,6 @@ async function checkBlocklist() {
     renderSummary(d.totals);
     renderResults(d.results, d.totals);
     $('bl-export-wrap').style.display = 'flex';
-
     let msg = 'Completed ' + d.results.length + ' IP checks in ' + d.elapsed + 's.';
     if (d.errors) msg += ' ' + d.errors + ' row(s) returned a provider error.';
     if (d.warning) msg += ' ' + d.warning;
@@ -1413,9 +1364,7 @@ async function checkBlocklist() {
     setTimeout(function () { progress.classList.add('hidden'); bar.style.width = '0%'; }, 700);
   }
 }
-
 function cancelBlocklist() { if (state.blAbort) state.blAbort.abort(); }
-
 function exportBlocklistCsv() {
   if (!state.blData || !state.blData.results) { toast('Nothing to export', 'err'); return; }
   const header = ['IP', 'CSS', 'PBL', 'SBL', 'Barracuda', 'RDNS', 'DBL_Domain', 'DBL'];
@@ -1441,11 +1390,39 @@ function exportBlocklistCsv() {
   toast('CSV exported', 'ok');
 }
 
+/* ============================================================
+   Email Hunter — multi-URL
+   ============================================================ */
 const hunterState = { abort: null, sid: null, pollTimer: null, data: null };
 
+function parseHunterUrls() {
+  const raw = $('hunter-urls').value || '';
+  const lines = raw.split(/[\n\r]+/).map(s => s.trim()).filter(Boolean);
+  // De-dup while preserving order
+  const seen = new Set();
+  const out = [];
+  for (const line of lines) {
+    const key = line.toLowerCase().replace(/^https?:\/\//, '').replace(/\/+$/, '');
+    if (!seen.has(key)) { seen.add(key); out.push(line); }
+  }
+  return out;
+}
+function updateHunterDomainCount() {
+  const urls = parseHunterUrls();
+  $('hunter-count-domains').textContent = urls.length;
+}
+$('hunter-urls').addEventListener('input', updateHunterDomainCount);
+updateHunterDomainCount();
+
+function clearHunterInput() {
+  $('hunter-urls').value = '';
+  updateHunterDomainCount();
+}
+
 async function startEmailHunter() {
-  const url = $('hunter-url').value.trim();
-  if (!url) { toast('Please enter a URL', 'err'); return; }
+  const urls = parseHunterUrls();
+  if (!urls.length) { toast('Enter at least one URL', 'err'); return; }
+  if (urls.length > 50) { toast('Maximum 50 URLs per crawl', 'err'); return; }
 
   const btn = $('hunter-btn');
   const cancelBtn = $('hunter-cancel');
@@ -1466,7 +1443,8 @@ async function startEmailHunter() {
   const startedAt = Date.now();
   const tick = setInterval(function () {
     const s = ((Date.now() - startedAt) / 1000).toFixed(0);
-    status.textContent = 'Crawling ' + url + '… ' + s + 's (max 120s)';
+    status.textContent = 'Crawling ' + urls.length + ' domain' + (urls.length > 1 ? 's' : '') +
+      '… ' + s + 's (max 120s shared)';
     const pct = Math.min(95, 8 + (s / 120) * 87);
     bar.style.width = pct.toFixed(1) + '%';
   }, 1000);
@@ -1476,7 +1454,7 @@ async function startEmailHunter() {
     const d = await api('/api/email-hunter/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: url }),
+      body: JSON.stringify({ urls: urls }),
       signal: hunterState.abort.signal
     });
     hunterState.sid = d.session_id;
@@ -1526,12 +1504,12 @@ function displayHunterResults(d) {
   const s = d.stats || {};
   const stats = $('hunter-stats');
   const items = [
+    ['Sites',         s.sites || 0],
     ['Emails',        s.emails || 0],
     ['Pages',         s.pages_visited || 0],
     ['Contact Pages', s.contact_pages || 0],
     ['Discovered',    s.discovered || 0],
     ['Visited',       s.visited || 0],
-    ['Errors',        s.errors || 0],
     ['Time (s)',      s.time_taken || 0],
   ];
   stats.innerHTML = items.map(function (x) {
@@ -1544,10 +1522,31 @@ function displayHunterResults(d) {
   $('hunter-emails').textContent = emails.length ? emails.join('\n') : 'No emails found.';
   $('hunter-emails-card').style.display = 'block';
 
-  $('hunter-status').textContent = 'Done — found ' + emails.length + ' unique email' +
-    (emails.length === 1 ? '' : 's') + ' in ' + (s.time_taken || 0) + 's.';
-}
+  // Per-domain breakdown
+  const byDomain = d.emails_by_domain || {};
+  const host = $('hunter-by-domain');
+  const domains = Object.keys(byDomain).sort();
+  if (domains.length) {
+    host.innerHTML = '<div class="label" style="margin-top:20px">Emails by domain</div>' +
+      domains.map(function (dom) {
+        const list = byDomain[dom] || [];
+        if (!list.length) return '';
+        return '<div class="domain-block">' +
+          '<div class="domain-block-header">' +
+          '<span>' + esc(dom) + '</span>' +
+          '<span class="count">' + list.length + ' email' + (list.length === 1 ? '' : 's') + '</span>' +
+          '</div>' +
+          '<div class="domain-block-body">' + esc(list.join('\n')) + '</div>' +
+          '</div>';
+      }).join('');
+  } else {
+    host.innerHTML = '';
+  }
 
+  $('hunter-status').textContent = 'Done — found ' + emails.length + ' unique email' +
+    (emails.length === 1 ? '' : 's') + ' across ' + (s.sites || 0) + ' site' +
+    ((s.sites || 0) === 1 ? '' : 's') + ' in ' + (s.time_taken || 0) + 's.';
+}
 function finishHunterUi() {
   const btn = $('hunter-btn');
   btn.disabled = false;
@@ -1555,7 +1554,6 @@ function finishHunterUi() {
   $('hunter-cancel').disabled = true;
   hunterState.abort = null;
 }
-
 function cancelEmailHunter() {
   if (hunterState.pollTimer) { clearInterval(hunterState.pollTimer); hunterState.pollTimer = null; }
   if (hunterState.abort) hunterState.abort.abort();
@@ -1563,12 +1561,10 @@ function cancelEmailHunter() {
   $('hunter-status').textContent = 'Cancelled.';
   setTimeout(function () { $('hunter-progress').classList.add('hidden'); }, 500);
 }
-
 async function copyHunterEmails(btn) {
   if (!hunterState.data || !hunterState.data.emails) { toast('Nothing to copy', 'err'); return; }
   await copyValue(hunterState.data.emails.join('\n'), btn);
 }
-
 function exportHunterCsv() {
   if (!hunterState.data || !hunterState.data.emails) { toast('Nothing to export', 'err'); return; }
   const lines = ['Email'].concat(hunterState.data.emails);
@@ -1584,6 +1580,9 @@ function exportHunterCsv() {
   toast('CSV exported', 'ok');
 }
 
+/* ============================================================
+   Boot
+   ============================================================ */
 $('year').textContent = new Date().getFullYear();
 showPage('home');
 
@@ -1592,7 +1591,7 @@ document.addEventListener('keydown', function (e) {
     const active = document.activeElement;
     if (active && active.id === 'enc-input') encodeText();
     if (active && active.id === 'dec-input') decodeText();
-    if (active && active.id === 'hunter-url') startEmailHunter();
+    if (active && active.id === 'hunter-urls') startEmailHunter();
   }
 });
 </script>
@@ -1629,29 +1628,61 @@ LOGIN_HTML = '''<!doctype html><html><head><meta charset="utf-8"><meta name="vie
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f7f8fa;color:#1a202c;font-family:'Inter',system-ui,-apple-system,'Segoe UI',Roboto,Arial,sans-serif;position:relative;overflow:hidden}
-body::before,body::after{content:'';position:fixed;border-radius:50%;filter:blur(120px);pointer-events:none}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f7f8fa;color:#1a202c;font-family:'Inter',system-ui,-apple-system,'Segoe UI',Roboto,Arial,sans-serif;position:relative;overflow:hidden;transition:background .3s ease,color .3s ease}
+body.dark{background:#0f1419;color:#e6edf3}
+body::before,body::after{content:'';position:fixed;border-radius:50%;filter:blur(120px);pointer-events:none;transition:opacity .3s ease}
 body::before{width:520px;height:520px;background:radial-gradient(circle,rgba(13,148,136,.10),transparent 70%);top:-200px;left:-160px}
 body::after{width:480px;height:480px;background:radial-gradient(circle,rgba(139,92,246,.08),transparent 70%);bottom:-200px;right:-160px}
-form{position:relative;z-index:2;width:min(400px,90vw);padding:38px;border:1px solid #e2e8f0;border-radius:20px;background:#ffffff;box-shadow:0 20px 60px rgba(15,23,42,.10)}
+body.dark::before{background:radial-gradient(circle,rgba(20,184,166,.14),transparent 70%)}
+body.dark::after{background:radial-gradient(circle,rgba(167,139,250,.10),transparent 70%)}
+#themebtn{position:fixed;top:16px;right:16px;z-index:10;width:44px;height:44px;border-radius:12px;border:1px solid #e2e8f0;background:#ffffff;color:#1a202c;font-size:18px;cursor:pointer;transition:.2s;box-shadow:0 4px 14px rgba(15,23,42,.08)}
+body.dark #themebtn{background:#161b22;border-color:#2d3540;color:#e6edf3;box-shadow:0 4px 14px rgba(0,0,0,.4)}
+#themebtn:hover{transform:scale(1.05)}
+form{position:relative;z-index:2;width:min(400px,90vw);padding:38px;border:1px solid #e2e8f0;border-radius:20px;background:#ffffff;box-shadow:0 20px 60px rgba(15,23,42,.10);transition:background .3s ease,border-color .3s ease,box-shadow .3s ease}
+body.dark form{background:#161b22;border-color:#2d3540;box-shadow:0 20px 60px rgba(0,0,0,.6)}
 form::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;border-radius:20px 20px 0 0;background:linear-gradient(90deg,#0d9488,#8b5cf6,#f59e0b)}
 h2{margin:0 0 8px;font-size:24px;font-weight:700;letter-spacing:-.02em;color:#1a202c}
+body.dark h2{color:#e6edf3}
 p{margin:6px 0;color:#718096;font-size:13.5px}
+body.dark p{color:#7d8590}
 input,button{width:100%;padding:14px;margin-top:11px;border-radius:12px;border:1px solid #e2e8f0;box-sizing:border-box;font:inherit;font-size:14.5px;font-family:inherit}
+body.dark input{border-color:#2d3540}
 input{background:#f4f6fa;color:#1a202c;outline:none;transition:.2s}
+body.dark input{background:#1c232b;color:#e6edf3}
 input:focus{border-color:#0d9488;box-shadow:0 0 0 3px rgba(13,148,136,.14);background:#ffffff}
+body.dark input:focus{background:#0f1419;box-shadow:0 0 0 3px rgba(20,184,166,.20)}
 button{background:#0d9488;color:#fff;font-weight:600;cursor:pointer;border:0;margin-top:20px;transition:.2s;box-shadow:0 4px 14px rgba(13,148,136,.28)}
+body.dark button{background:#14b8a6}
 button:hover{transform:translateY(-2px);background:#0f766e;box-shadow:0 8px 20px rgba(13,148,136,.36)}
+body.dark button:hover{background:#0d9488}
 .e{color:#dc2626;margin:10px 0 0;font-size:13px;font-weight:500}
+body.dark .e{color:#f87171}
 .n{color:#d97706;margin:10px 0 0;font-size:13px;font-weight:500}
-</style></head><body><form method="post">
+body.dark .n{color:#fbbf24}
+</style></head><body>
+<button id="themebtn" onclick="toggleTheme()" title="Toggle theme">🌙</button>
+<form method="post">
 <h2>Email journeys</h2>
 <p>Sign in to continue.</p>{{ERR}}{{NOTICE}}
 <input name="username" placeholder="Username" required autofocus autocomplete="username">
 <input name="password" type="password" placeholder="Password" required autocomplete="current-password">
 <input type="hidden" name="next" value="{{NEXT}}">
 <button type="submit">Login</button>
-</form></body></html>'''
+</form>
+<script>
+(function(){
+  const t = localStorage.getItem('ej_theme') || 'light';
+  if (t === 'dark') document.body.classList.add('dark');
+  const b = document.getElementById('themebtn');
+  b.textContent = (t === 'dark') ? '☀️' : '🌙';
+  window.toggleTheme = function() {
+    const isDark = document.body.classList.toggle('dark');
+    localStorage.setItem('ej_theme', isDark ? 'dark' : 'light');
+    document.getElementById('themebtn').textContent = isDark ? '☀️' : '🌙';
+  };
+})();
+</script>
+</body></html>'''
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -2241,18 +2272,40 @@ def blocklist_check_api():
 
 
 # ============================================================
-# Email Hunter API
+# Email Hunter API — multi-URL
 # ============================================================
 @app.post("/api/email-hunter/start")
 def email_hunter_start():
     if not HAS_HUNTER:
         return jsonify(error="Email Hunter deps missing. Run: pip install requests beautifulsoup4"), 500
     data = request.get_json(silent=True) or {}
-    url = str(data.get("url", "")).strip()
-    if not url:
-        return jsonify(error="URL is required"), 400
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
+
+    # Accept both a list ("urls") and a single string ("url") for compatibility
+    raw_urls = data.get("urls")
+    if not raw_urls:
+        single = str(data.get("url", "")).strip()
+        raw_urls = [single] if single else []
+    if isinstance(raw_urls, str):
+        raw_urls = [raw_urls]
+
+    norm_urls = []
+    seen = set()
+    for u in raw_urls:
+        u = str(u or "").strip()
+        if not u:
+            continue
+        if not u.startswith(("http://", "https://")):
+            u = "https://" + u
+        key = u.rstrip("/").lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        norm_urls.append(u.rstrip("/"))
+
+    if not norm_urls:
+        return jsonify(error="At least one URL is required"), 400
+    if len(norm_urls) > 50:
+        return jsonify(error="Maximum 50 URLs per crawl"), 400
 
     sid = secrets.token_urlsafe(12)
     _hunter_status[sid] = "running"
@@ -2260,7 +2313,7 @@ def email_hunter_start():
 
     def _run():
         try:
-            crawler = EmailHunterCrawler(url)
+            crawler = EmailHunterCrawler(norm_urls)
             result = crawler.crawl()
             _hunter_store[sid] = result
             _hunter_status[sid] = "completed"
@@ -2269,7 +2322,7 @@ def email_hunter_start():
             _hunter_status[sid] = "error"
 
     threading.Thread(target=_run, daemon=True).start()
-    return jsonify(session_id=sid, status="running")
+    return jsonify(session_id=sid, status="running", domains=norm_urls)
 
 
 @app.get("/api/email-hunter/results/<sid>")
