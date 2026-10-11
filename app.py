@@ -1,6 +1,7 @@
 # ============================================================
 # Email journeys — Single-file Flask App (Cloud Light + Night)
 # Multi-URL Email Hunter · Theme Toggle · Session 1 hour
+# Real-browser UA · Per-domain fairness · Round-robin crawl
 # ============================================================
 from flask import Flask, request, jsonify, session, redirect, url_for, Response
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -55,7 +56,14 @@ def _handle_any_error(e):
 if HAS_HUNTER:
     HUNTER_MAX_TIME = 120
     HUNTER_TIMEOUT = 15
-    HUNTER_UA = "Mozilla/5.0 (compatible; EmailHunter/1.0)"
+    HUNTER_MIN_PER_DOMAIN = 20
+
+    HUNTER_UAS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+    ]
     HUNTER_LINK_ATTRS = ["href", "src", "data-url", "data-href", "onclick"]
     HUNTER_CONTACT_KEYWORDS = [
         "contact", "kontakt", "impressum", "about", "team",
@@ -84,6 +92,8 @@ if HAS_HUNTER:
             return False
         if local.startswith(".") or local.endswith("."):
             return False
+        if len(local) < 2:
+            return False
         return True
 
     def hunter_extract_emails(text):
@@ -99,36 +109,51 @@ if HAS_HUNTER:
         return found
 
     class EmailHunterCrawler:
-        """Crawls one or more start URLs within a shared 2-minute budget."""
+        """Multi-domain crawler with per-domain fairness and real-browser UAs."""
 
         def __init__(self, start_urls):
             if isinstance(start_urls, str):
                 start_urls = [start_urls]
             self.start_urls = [u.rstrip("/") for u in start_urls if u and u.strip()]
+            self.domain_map = {}
             self.domains = set()
-            for u in self.start_urls:
-                netloc = urlparse(u).netloc.lower()
-                if netloc:
-                    self.domains.add(netloc)
-                    # Accept www and non-www interchangeably
-                    if netloc.startswith("www."):
-                        self.domains.add(netloc[4:])
-                    else:
-                        self.domains.add("www." + netloc)
+            self.per_domain_queue = {}
+            self.domain_visited = {}
+            self.domain_email_set = {}
             self.visited = set()
-            self.queue = _deque_h()
             self.emails = set()
-            self.emails_by_domain = {}
             self.stats = {
                 "pages_visited": 0, "contact_pages": 0,
                 "errors": 0, "discovered": 0, "visited": 0,
                 "sites": len(self.start_urls),
+                "last_error": None,
             }
             self.start_time = None
+            self._ua_index = 0
+
+            for u in self.start_urls:
+                netloc = urlparse(u).netloc.lower()
+                if not netloc:
+                    continue
+                key = netloc[4:] if netloc.startswith("www.") else netloc
+                self.domain_map[netloc] = key
+                self.domains.add(netloc)
+                self.domains.add("www." + key)
+                self.domains.add(key)
+                self.per_domain_queue.setdefault(key, _deque_h())
+                self.domain_visited.setdefault(key, set())
+                self.domain_email_set.setdefault(key, set())
+
+        def _ua(self):
+            self._ua_index = (self._ua_index + 1) % len(HUNTER_UAS)
+            return HUNTER_UAS[self._ua_index]
+
+        def _domain_key(self, url):
+            netloc = urlparse(url).netloc.lower()
+            return self.domain_map.get(netloc) or (netloc[4:] if netloc.startswith("www.") else netloc)
 
         def _is_internal(self, url):
-            p = urlparse(url)
-            netloc = p.netloc.lower()
+            netloc = urlparse(url).netloc.lower()
             return netloc in self.domains or netloc == ""
 
         def _normalize(self, base, link):
@@ -164,14 +189,36 @@ if HAS_HUNTER:
             return links
 
         def _fetch(self, url):
+            headers = {
+                "User-Agent": self._ua(),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9,de;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Cache-Control": "max-age=0",
+            }
             try:
-                r = requests.get(
-                    url, headers={"User-Agent": HUNTER_UA},
-                    timeout=HUNTER_TIMEOUT, allow_redirects=True,
-                )
-                return r.text if r.status_code == 200 else None
-            except Exception:
+                r = requests.get(url, headers=headers, timeout=HUNTER_TIMEOUT, allow_redirects=True)
+                if r.status_code == 200:
+                    if r.encoding and r.encoding.lower() in ("iso-8859-1", "ascii"):
+                        r.encoding = r.apparent_encoding or "utf-8"
+                    return r.text
+                if r.status_code in (403, 429):
+                    headers["User-Agent"] = self._ua()
+                    r2 = requests.get(url, headers=headers, timeout=HUNTER_TIMEOUT, allow_redirects=True)
+                    if r2.status_code == 200:
+                        return r2.text
+                    self.stats["last_error"] = f"HTTP {r2.status_code} for {url}"
+                    self.stats["errors"] += 1
+                    return None
+                return None
+            except Exception as e:
                 self.stats["errors"] += 1
+                self.stats["last_error"] = f"{type(e).__name__}: {e}"
                 return None
 
         def _discover_sitemaps(self, base_url):
@@ -179,7 +226,7 @@ if HAS_HUNTER:
             try:
                 r = requests.get(
                     f"{base_url}/robots.txt",
-                    headers={"User-Agent": HUNTER_UA}, timeout=10,
+                    headers={"User-Agent": self._ua()}, timeout=10,
                 )
                 if r.status_code == 200:
                     for line in r.text.splitlines():
@@ -194,7 +241,7 @@ if HAS_HUNTER:
         def _parse_sitemap(self, sm_url):
             urls = set()
             try:
-                r = requests.get(sm_url, headers={"User-Agent": HUNTER_UA}, timeout=10)
+                r = requests.get(sm_url, headers={"User-Agent": self._ua()}, timeout=10)
                 if r.status_code != 200:
                     return urls
                 soup = BeautifulSoup(r.text, "xml")
@@ -204,34 +251,76 @@ if HAS_HUNTER:
                 pass
             return urls
 
-        def _prioritize(self):
-            prior, rest = [], []
-            while self.queue:
-                u = self.queue.popleft()
-                (prior if self._is_contact(u) else rest).append(u)
-            self.queue = _deque_h(prior + rest)
+        def _enqueue(self, url):
+            if url in self.visited:
+                return False
+            key = self._domain_key(url)
+            q = self.per_domain_queue.setdefault(key, _deque_h())
+            if url in q:
+                return False
+            if self._is_contact(url):
+                q.appendleft(url)
+            else:
+                q.append(url)
+            self.stats["discovered"] += 1
+            return True
+
+        def _next_url_round_robin(self, keys, cursor):
+            n = len(keys)
+            for _ in range(n):
+                key = keys[cursor % n]
+                cursor = (cursor + 1) % n
+                q = self.per_domain_queue.get(key)
+                if q:
+                    while q:
+                        url = q.popleft()
+                        if url not in self.visited:
+                            return key, url
+            return None, None
 
         def crawl(self):
             self.start_time = time.time()
 
-            # Seed all start URLs + their sitemaps
             for u in self.start_urls:
-                self.queue.append(u)
+                self._enqueue(u)
             for u in self.start_urls:
                 for sm in self._discover_sitemaps(u):
                     for s in self._parse_sitemap(sm):
-                        if self._is_internal(s) and s not in self.visited:
-                            self.queue.append(s)
+                        if self._is_internal(s):
+                            self._enqueue(s)
 
-            while self.queue and (time.time() - self.start_time) < HUNTER_MAX_TIME:
-                self._prioritize()
-                url = self.queue.popleft()
+            keys = list(self.per_domain_queue.keys())
+            if not keys:
+                return {"emails": [], "emails_by_domain": {}, "stats": self.stats}
+
+            total = len(keys)
+            per_domain_budget = max(HUNTER_MIN_PER_DOMAIN, HUNTER_MAX_TIME // total)
+            overall_deadline = self.start_time + HUNTER_MAX_TIME
+            domain_time_used = {k: 0.0 for k in keys}
+            cursor = 0
+
+            while time.time() < overall_deadline:
+                if all(domain_time_used[k] >= per_domain_budget for k in keys):
+                    break
+                key, url = self._next_url_round_robin(keys, cursor)
+                cursor += 1
+                if url is None:
+                    break
+
+                if domain_time_used.get(key, 0) >= per_domain_budget:
+                    self.per_domain_queue.setdefault(key, _deque_h()).appendleft(url)
+                    continue
+
                 if url in self.visited:
                     continue
                 self.visited.add(url)
+                self.domain_visited.setdefault(key, set()).add(url)
                 self.stats["visited"] += 1
 
+                t0 = time.time()
                 html = self._fetch(url)
+                domain_time_used[key] = domain_time_used.get(key, 0) + (time.time() - t0)
+
                 if not html:
                     continue
 
@@ -240,12 +329,9 @@ if HAS_HUNTER:
                     self.stats["contact_pages"] += 1
 
                 found = hunter_extract_emails(html)
-                self.emails.update(found)
-
-                # Track which domain each email came from
-                host = urlparse(url).netloc.lower()
-                if host:
-                    self.emails_by_domain.setdefault(host, set()).update(found)
+                if found:
+                    self.emails.update(found)
+                    self.domain_email_set.setdefault(key, set()).update(found)
 
                 try:
                     soup = BeautifulSoup(html, "html.parser")
@@ -258,18 +344,17 @@ if HAS_HUNTER:
                         e = href[7:].split("?")[0].strip().lower()
                         if _is_valid_email(e):
                             self.emails.add(e)
-                            if host:
-                                self.emails_by_domain.setdefault(host, set()).add(e)
+                            self.domain_email_set.setdefault(key, set()).add(e)
 
                 for link in self._extract_links(soup, url):
-                    if link not in self.visited and link not in self.queue:
-                        self.queue.append(link)
-                        self.stats["discovered"] += 1
+                    if link not in self.visited:
+                        self._enqueue(link)
 
             self.stats["emails"] = len(self.emails)
             self.stats["time_taken"] = round(time.time() - self.start_time, 2)
-            # Serialize per-domain breakdown
-            by_domain = {d: sorted(list(s)) for d, s in self.emails_by_domain.items()}
+            by_domain = {
+                d: sorted(list(s)) for d, s in self.domain_email_set.items() if s
+            }
             return {
                 "emails": sorted(self.emails),
                 "emails_by_domain": by_domain,
@@ -568,7 +653,6 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
 .bl-total td{background:var(--panel-2);font-weight:700;border-top:2px solid var(--line-strong)}
 .bl-dbl-domain{display:block;margin-top:5px;color:var(--muted);font-size:10.5px;word-break:break-all}
 
-/* Email Hunter multi-URL box */
 .hunter-box textarea{
   min-height:130px;font-family:'JetBrains Mono',monospace;font-size:13px;line-height:1.75;
 }
@@ -1398,7 +1482,6 @@ const hunterState = { abort: null, sid: null, pollTimer: null, data: null };
 function parseHunterUrls() {
   const raw = $('hunter-urls').value || '';
   const lines = raw.split(/[\n\r]+/).map(s => s.trim()).filter(Boolean);
-  // De-dup while preserving order
   const seen = new Set();
   const out = [];
   for (const line of lines) {
@@ -1522,7 +1605,6 @@ function displayHunterResults(d) {
   $('hunter-emails').textContent = emails.length ? emails.join('\n') : 'No emails found.';
   $('hunter-emails-card').style.display = 'block';
 
-  // Per-domain breakdown
   const byDomain = d.emails_by_domain || {};
   const host = $('hunter-by-domain');
   const domains = Object.keys(byDomain).sort();
@@ -2280,7 +2362,6 @@ def email_hunter_start():
         return jsonify(error="Email Hunter deps missing. Run: pip install requests beautifulsoup4"), 500
     data = request.get_json(silent=True) or {}
 
-    # Accept both a list ("urls") and a single string ("url") for compatibility
     raw_urls = data.get("urls")
     if not raw_urls:
         single = str(data.get("url", "")).strip()
