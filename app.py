@@ -1,25 +1,44 @@
-from flask import Flask, request, jsonify, session, redirect, url_for, Response, render_template
+# ============================================================
+# Email journeys — Single-file Flask App (Final)
+# Includes: Converter, Generators, Blocklist, Email Hunter
+# ============================================================
+from flask import Flask, request, jsonify, session, redirect, url_for, Response
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.exceptions import HTTPException
 from email.header import decode_header
-from html import unescape as html_lib_unescape
-import urllib.request, urllib.error, gzip
-import base64, random, string, secrets, socket, ipaddress, os, threading, time, re
+from datetime import timedelta
+import base64, random, string, secrets, socket, ipaddress, os, threading, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse, urljoin, urldefrag
-import requests
-from bs4 import BeautifulSoup
+
+# --- Email Hunter deps (optional; app still runs if missing) ---
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    import re as _re_h
+    from urllib.parse import urljoin, urlparse, urlunparse
+    from collections import deque as _deque_h
+    HAS_HUNTER = True
+except ImportError:
+    HAS_HUNTER = False
 
 app = Flask(__name__)
-app.secret_key = "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET_123456789"
-app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_SECURE=False)
+app.secret_key = os.environ.get("SECRET_KEY", "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET_123456789")
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=False,
+    PERMANENT_SESSION_LIFETIME=timedelta(minutes=10),
+    SESSION_REFRESH_EACH_REQUEST=False,
+)
 
-LOGIN_USERNAME = "admin"
-LOGIN_PASSWORD_HASH = generate_password_hash("admin")
+SESSION_MAX_AGE = 10 * 60
+
+LOGIN_USERNAME = os.environ.get("LOGIN_USERNAME", "admin")
+LOGIN_PASSWORD_HASH = generate_password_hash(os.environ.get("LOGIN_PASSWORD", "admin"))
 
 
 # ============================================================
-# Error handler — non-API errors are NOT escalated to 500
+# Error handler
 # ============================================================
 @app.errorhandler(Exception)
 def _handle_any_error(e):
@@ -35,9 +54,1448 @@ def _handle_any_error(e):
 
 
 # ============================================================
-# INDEX_HTML (embedded)
+# Email Hunter — crawler + extractor
 # ============================================================
+if HAS_HUNTER:
+    HUNTER_MAX_TIME = 120
+    HUNTER_TIMEOUT = 15
+    HUNTER_UA = "Mozilla/5.0 (compatible; EmailHunter/1.0)"
+    HUNTER_LINK_ATTRS = ["href", "src", "data-url", "data-href", "onclick"]
+    HUNTER_CONTACT_KEYWORDS = [
+        "contact", "kontakt", "impressum", "about", "team",
+        "directory", "service", "support", "help", "info"
+    ]
 
+    _EMAIL_RE = _re_h.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+    _OBFUSCATED_RE = _re_h.compile(
+        r"([a-zA-Z0-9._%+\-]+)\s*(?:\[at\]|\(at\)|\bat\b)\s*"
+        r"([a-zA-Z0-9.\-]+)\s*(?:\[dot\]|\(dot\)|\bdot\b)\s*"
+        r"([a-zA-Z]{2,})",
+        _re_h.IGNORECASE
+    )
+    _BAD_EXT = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp",
+                ".css", ".js", ".ico", ".woff", ".woff2", ".ttf")
+
+    def _is_valid_email(e):
+        if not e or len(e) > 254 or e.count("@") != 1:
+            return False
+        local, domain = e.split("@")
+        if not local or not domain or "." not in domain:
+            return False
+        if domain.startswith(".") or domain.endswith("."):
+            return False
+        if any(domain.endswith(x) for x in _BAD_EXT):
+            return False
+        if local.startswith(".") or local.endswith("."):
+            return False
+        return True
+
+    def hunter_extract_emails(text):
+        found = set()
+        for m in _EMAIL_RE.findall(text):
+            e = m.strip().rstrip(".,;:").lower()
+            if _is_valid_email(e):
+                found.add(e)
+        for local, mid, tld in _OBFUSCATED_RE.findall(text):
+            e = f"{local}@{mid}.{tld}".lower()
+            if _is_valid_email(e):
+                found.add(e)
+        return found
+
+    class EmailHunterCrawler:
+        def __init__(self, start_url):
+            self.start_url = start_url.rstrip("/")
+            self.domain = urlparse(start_url).netloc
+            self.visited = set()
+            self.queue = _deque_h()
+            self.emails = set()
+            self.stats = {
+                "pages_visited": 0, "contact_pages": 0,
+                "errors": 0, "discovered": 0, "visited": 0,
+            }
+            self.start_time = None
+
+        def _is_internal(self, url):
+            p = urlparse(url)
+            return p.netloc == self.domain or p.netloc == ""
+
+        def _normalize(self, base, link):
+            try:
+                absolute = urljoin(base, link)
+                p = urlparse(absolute)
+                if p.scheme not in ("http", "https"):
+                    return None
+                return urlunparse(p._replace(fragment=""))
+            except Exception:
+                return None
+
+        def _is_contact(self, url):
+            path = urlparse(url).path.lower()
+            return any(kw in path for kw in HUNTER_CONTACT_KEYWORDS)
+
+        def _extract_links(self, soup, base_url):
+            links = set()
+            for tag in soup.find_all(True):
+                for attr in HUNTER_LINK_ATTRS:
+                    val = tag.get(attr)
+                    if not val:
+                        continue
+                    if attr == "onclick":
+                        m = _re_h.search(r"['\"]([^'\"]+)['\"]", str(val))
+                        if m:
+                            val = m.group(1)
+                        else:
+                            continue
+                    cand = self._normalize(base_url, val)
+                    if cand and self._is_internal(cand):
+                        links.add(cand)
+            return links
+
+        def _fetch(self, url):
+            try:
+                r = requests.get(
+                    url, headers={"User-Agent": HUNTER_UA},
+                    timeout=HUNTER_TIMEOUT, allow_redirects=True,
+                )
+                return r.text if r.status_code == 200 else None
+            except Exception:
+                self.stats["errors"] += 1
+                return None
+
+        def _discover_sitemaps(self):
+            sitemaps = []
+            try:
+                r = requests.get(
+                    f"{self.start_url}/robots.txt",
+                    headers={"User-Agent": HUNTER_UA}, timeout=10,
+                )
+                if r.status_code == 200:
+                    for line in r.text.splitlines():
+                        if line.lower().startswith("sitemap:"):
+                            sitemaps.append(line.split(":", 1)[1].strip())
+            except Exception:
+                pass
+            for path in ["/sitemap.xml", "/sitemap", "/site-map", "/sitemap_index.xml"]:
+                sitemaps.append(urljoin(self.start_url, path))
+            return list(set(sitemaps))
+
+        def _parse_sitemap(self, sm_url):
+            urls = set()
+            try:
+                r = requests.get(sm_url, headers={"User-Agent": HUNTER_UA}, timeout=10)
+                if r.status_code != 200:
+                    return urls
+                soup = BeautifulSoup(r.text, "xml")
+                for loc in soup.find_all("loc"):
+                    urls.add(loc.text.strip())
+            except Exception:
+                pass
+            return urls
+
+        def _prioritize(self):
+            prior, rest = [], []
+            while self.queue:
+                u = self.queue.popleft()
+                (prior if self._is_contact(u) else rest).append(u)
+            self.queue = _deque_h(prior + rest)
+
+        def crawl(self):
+            self.start_time = time.time()
+            self.queue.append(self.start_url)
+
+            for sm in self._discover_sitemaps():
+                for u in self._parse_sitemap(sm):
+                    if self._is_internal(u) and u not in self.visited:
+                        self.queue.append(u)
+
+            while self.queue and (time.time() - self.start_time) < HUNTER_MAX_TIME:
+                self._prioritize()
+                url = self.queue.popleft()
+                if url in self.visited:
+                    continue
+                self.visited.add(url)
+                self.stats["visited"] += 1
+
+                html = self._fetch(url)
+                if not html:
+                    continue
+
+                self.stats["pages_visited"] += 1
+                if self._is_contact(url):
+                    self.stats["contact_pages"] += 1
+
+                self.emails.update(hunter_extract_emails(html))
+
+                try:
+                    soup = BeautifulSoup(html, "html.parser")
+                except Exception:
+                    continue
+
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    if href.lower().startswith("mailto:"):
+                        e = href[7:].split("?")[0].strip().lower()
+                        if _is_valid_email(e):
+                            self.emails.add(e)
+
+                for link in self._extract_links(soup, url):
+                    if link not in self.visited and link not in self.queue:
+                        self.queue.append(link)
+                        self.stats["discovered"] += 1
+
+            self.stats["emails"] = len(self.emails)
+            self.stats["time_taken"] = round(time.time() - self.start_time, 2)
+            return {"emails": sorted(self.emails), "stats": self.stats}
+
+    _hunter_store = {}
+    _hunter_status = {}
+
+
+# ============================================================
+# INDEX_HTML
+# ============================================================
+INDEX_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Email journeys</title>
+<meta name="description" content="Email journey toolkit — UTF-8 Q, Base64 encoder/decoder, random generators, bulk blocklist checks and email hunter.">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --radius:20px;
+  --bg:#fdf8f0;
+  --bg-soft:#f6efe2;
+  --panel:#ffffff;
+  --panel2:#fbf4e9;
+  --text:#1c1613;
+  --text-soft:#5c524a;
+  --muted:#8c8078;
+  --line:#efe2cf;
+  --line2:#dfcbb0;
+  --accent:#e05a3a;
+  --accent2:#e89b3c;
+  --accent3:#d94a7a;
+  --ok:#4d8a5e;
+  --warn:#c07a1a;
+  --danger:#c4394a;
+  --shadow:0 22px 50px rgba(120,80,50,.10);
+  --shadow-lg:0 34px 70px rgba(120,80,50,.16);
+  --glow:0 0 40px rgba(224,90,58,.18);
+}
+body.dark{
+  --bg:#100b0a;
+  --bg-soft:#181110;
+  --panel:#1a1413;
+  --panel2:#221a18;
+  --text:#f6ede2;
+  --text-soft:#cdbfb1;
+  --muted:#8e7f72;
+  --line:#2b2220;
+  --line2:#3d302c;
+  --accent:#ff8a65;
+  --accent2:#ffb356;
+  --accent3:#ff6f9c;
+  --ok:#6fbf85;
+  --warn:#ffc247;
+  --danger:#ff7a8a;
+  --shadow:0 24px 60px rgba(0,0,0,.55);
+  --shadow-lg:0 36px 80px rgba(0,0,0,.65);
+  --glow:0 0 40px rgba(255,138,101,.22);
+}
+
+*,*::before,*::after{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{
+  margin:0;min-height:100vh;
+  font-family:'Outfit',system-ui,-apple-system,'Segoe UI',Roboto,Arial,sans-serif;
+  font-weight:400;
+  background:var(--bg);color:var(--text);
+  -webkit-font-smoothing:antialiased;
+  transition:background .35s ease,color .35s ease;
+  letter-spacing:-0.01em;
+}
+code,pre,.mono,.output{font-family:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+
+.bg-orbs{position:fixed;inset:0;overflow:hidden;pointer-events:none;z-index:0}
+.bg-orbs span{position:absolute;border-radius:50%;filter:blur(120px);opacity:.55;animation:drift 26s ease-in-out infinite}
+.bg-orbs span:nth-child(1){width:620px;height:620px;background:radial-gradient(circle,var(--accent),transparent 70%);top:-220px;left:-180px}
+.bg-orbs span:nth-child(2){width:520px;height:520px;background:radial-gradient(circle,var(--accent2),transparent 70%);top:-140px;right:-160px;animation-delay:-8s}
+.bg-orbs span:nth-child(3){width:520px;height:520px;background:radial-gradient(circle,var(--accent3),transparent 70%);bottom:-220px;left:38%;animation-delay:-16s}
+body.dark .bg-orbs span{opacity:.32}
+@keyframes drift{0%,100%{transform:translate3d(0,0,0) scale(1)}50%{transform:translate3d(40px,-50px,0) scale(1.14)}}
+
+.app{position:relative;z-index:1;max-width:1260px;margin:0 auto;padding:22px 22px 0}
+
+.topbar{
+  position:sticky;top:12px;z-index:40;
+  display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;
+  padding:12px 16px;margin:0 0 30px;
+  background:color-mix(in srgb,var(--panel) 78%,transparent);
+  backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+  border:1px solid var(--line);border-radius:18px;
+  box-shadow:var(--shadow);
+}
+.brand{display:flex;align-items:center;gap:12px;cursor:pointer;user-select:none}
+.brand svg{width:42px;height:42px;flex:0 0 auto;filter:drop-shadow(0 6px 16px rgba(224,90,58,.30))}
+.brand b{display:block;font-size:15.5px;font-weight:700;letter-spacing:-.02em}
+.brand span{display:block;color:var(--muted);font-size:9.5px;letter-spacing:2px;margin-top:2px;font-weight:600}
+.nav{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.nav button{
+  border:1px solid transparent;background:transparent;color:var(--text-soft);
+  padding:9px 15px;border-radius:11px;cursor:pointer;font-weight:600;font-size:13.5px;
+  transition:.2s ease;font-family:inherit;letter-spacing:-.01em;
+}
+.nav button:hover{color:var(--text);background:var(--panel2)}
+.nav button.active{
+  color:#fff;background:linear-gradient(120deg,var(--accent),var(--accent2));
+  box-shadow:0 8px 22px rgba(224,90,58,.35);
+}
+.nav .icon-btn{padding:9px 13px;font-size:15px;background:var(--panel2);border:1px solid var(--line)}
+.nav .logout{
+  background:transparent;border:1px solid color-mix(in srgb,var(--danger) 35%,transparent);
+  color:var(--danger);font-weight:600;
+}
+.nav .logout:hover{background:color-mix(in srgb,var(--danger) 12%,transparent);color:var(--danger)}
+
+.page{display:none;animation:fade .4s ease}
+.page.active{display:block}
+@keyframes fade{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+
+.home-hero{
+  display:grid;grid-template-columns:1.05fr .95fr;gap:36px;align-items:center;
+  padding:34px 8px 44px;
+}
+.hero-left{max-width:580px}
+.pill{
+  display:inline-flex;align-items:center;gap:8px;
+  padding:6px 14px;border-radius:99px;
+  font-size:12px;font-weight:600;letter-spacing:.02em;
+  background:color-mix(in srgb,var(--accent) 10%,transparent);
+  color:var(--accent);border:1px solid color-mix(in srgb,var(--accent) 25%,transparent);
+}
+.pill .dot{width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 10px var(--accent);animation:pulse 1.8s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.hero-left h1{
+  font-size:clamp(38px,5.4vw,66px);line-height:1.02;margin:22px 0 18px;
+  letter-spacing:-.035em;font-weight:700;
+}
+.hero-left h1 .swipe{
+  background:linear-gradient(100deg,var(--accent),var(--accent2),var(--accent3));
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+  background-size:220% auto;animation:shine 7s linear infinite;font-style:italic;font-weight:800;
+}
+@keyframes shine{to{background-position:220% center}}
+.hero-left p.lede{
+  color:var(--text-soft);font-size:16.5px;line-height:1.7;margin:0 0 26px;max-width:540px;
+}
+.hero-cta{display:flex;gap:10px;flex-wrap:wrap}
+.micro-stats{display:flex;gap:22px;margin-top:32px;padding-top:26px;border-top:1px solid var(--line);flex-wrap:wrap}
+.micro-stats div{display:flex;flex-direction:column;gap:2px}
+.micro-stats b{font-size:22px;font-weight:700;letter-spacing:-.03em;line-height:1}
+.micro-stats span{font-size:11.5px;color:var(--muted);font-weight:500;letter-spacing:.02em}
+
+.hero-right{position:relative}
+.preview-window{
+  position:relative;border-radius:22px;overflow:hidden;
+  background:var(--panel);border:1px solid var(--line);
+  box-shadow:var(--shadow-lg);transform:rotate(-1.2deg);
+  transition:transform .5s ease;
+}
+.preview-window:hover{transform:rotate(0deg) translateY(-4px)}
+.window-bar{
+  display:flex;align-items:center;gap:8px;padding:12px 16px;
+  background:var(--panel2);border-bottom:1px solid var(--line);
+}
+.window-bar .dot{width:10px;height:10px;border-radius:50%}
+.window-bar .dot.r{background:#ff5f57}.window-bar .dot.y{background:#ffbd2e}.window-bar .dot.g{background:#28c840}
+.window-bar b{margin-left:8px;font-size:12px;font-weight:600;color:var(--muted);letter-spacing:.04em}
+.window-body{padding:20px;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.9}
+.win-line{display:flex;gap:10px;align-items:flex-start;padding:5px 0;word-break:break-all}
+.win-tag{
+  flex:0 0 auto;font-size:10px;font-weight:700;letter-spacing:.06em;
+  padding:2px 8px;border-radius:6px;margin-top:2px;
+}
+.tag-in{background:color-mix(in srgb,var(--accent) 15%,transparent);color:var(--accent)}
+.tag-q1{background:color-mix(in srgb,var(--accent2) 18%,transparent);color:var(--accent2)}
+.tag-q2{background:color-mix(in srgb,var(--accent3) 15%,transparent);color:var(--accent3)}
+.tag-b64{background:color-mix(in srgb,var(--ok) 15%,transparent);color:var(--ok)}
+.win-text{color:var(--text-soft);font-size:11.5px;line-height:1.6}
+
+.stats-strip{
+  display:grid;grid-template-columns:repeat(4,1fr);gap:2px;
+  background:var(--line);border-radius:20px;overflow:hidden;
+  border:1px solid var(--line);margin-bottom:44px;
+}
+.stats-strip > div{padding:26px 22px;background:var(--panel);text-align:center}
+.stats-strip b{display:block;font-size:34px;font-weight:700;letter-spacing:-.04em;line-height:1;margin-bottom:6px;
+  background:linear-gradient(120deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent;}
+.stats-strip span{font-size:11.5px;color:var(--muted);font-weight:500;letter-spacing:.02em}
+
+.bento{display:grid;grid-template-columns:1.4fr 1fr 1fr;grid-template-rows:auto auto;gap:16px;margin-bottom:20px}
+.bento-card{
+  padding:28px;border-radius:22px;
+  background:var(--panel);border:1px solid var(--line);
+  box-shadow:var(--shadow);position:relative;overflow:hidden;
+  transition:.3s ease;
+}
+.bento-card:hover{transform:translateY(-3px);box-shadow:var(--shadow-lg);border-color:var(--line2)}
+.bento-card.big{grid-column:1/3;grid-row:1}
+.bento-card.tall{grid-column:3/4;grid-row:1/3}
+.bento-card.wide{grid-column:1/3;grid-row:2}
+.bento-card .bic{
+  width:46px;height:46px;border-radius:14px;display:grid;place-items:center;font-size:22px;margin-bottom:16px;
+  background:linear-gradient(135deg,color-mix(in srgb,var(--accent) 18%,transparent),color-mix(in srgb,var(--accent2) 18%,transparent));
+  border:1px solid color-mix(in srgb,var(--accent) 20%,transparent);
+}
+.bento-card h3{margin:0 0 8px;font-size:19px;font-weight:700;letter-spacing:-.02em}
+.bento-card p{color:var(--text-soft);font-size:13.5px;line-height:1.65;margin:0;max-width:520px}
+.bento-card .baa{
+  display:inline-flex;align-items:center;gap:6px;margin-top:16px;
+  font-size:12.5px;font-weight:600;color:var(--accent);cursor:pointer;
+  border:0;background:transparent;padding:0;font-family:inherit;
+}
+.bento-card .baa:hover{gap:10px}
+.bento-card .baa::after{content:'→';transition:.2s}
+
+.section-head{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;margin:4px 0 20px;flex-wrap:wrap}
+.section-head h2{margin:0;font-size:28px;letter-spacing:-.03em;font-weight:700}
+.section-head p{margin:6px 0 0;color:var(--muted);font-size:13.5px;line-height:1.65;max-width:760px}
+
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:24px;box-shadow:var(--shadow)}
+.card h3{margin:0 0 16px;font-size:16px;font-weight:700;letter-spacing:-.02em}
+
+.tabs{display:flex;gap:6px;margin-bottom:20px;flex-wrap:wrap;padding:5px;background:var(--panel2);border-radius:14px;width:fit-content;border:1px solid var(--line)}
+.tab{padding:9px 16px;border-radius:10px;border:0;background:transparent;color:var(--muted);cursor:pointer;font-weight:600;font-size:13px;transition:.2s;font-family:inherit;letter-spacing:-.01em}
+.tab:hover{color:var(--text)}
+.tab.active{color:#fff;background:linear-gradient(120deg,var(--accent),var(--accent2));box-shadow:0 6px 18px rgba(224,90,58,.3)}
+
+.workspace{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+.label{display:block;color:var(--muted);font-size:10.5px;font-weight:700;letter-spacing:1.6px;margin:0 0 8px;text-transform:uppercase}
+textarea,input[type=text],input[type=number]{
+  width:100%;font:inherit;font-size:14px;color:var(--text);
+  background:var(--panel2);border:1px solid var(--line);border-radius:13px;
+  padding:13px 15px;outline:none;transition:.2s;font-family:inherit;
+}
+textarea{min-height:170px;resize:vertical;line-height:1.7}
+textarea:focus,input:focus{border-color:var(--accent);box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 16%,transparent);background:var(--panel)}
+textarea[readonly]{cursor:text}
+
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+.result{margin-top:14px}
+.output{
+  min-height:96px;white-space:pre-wrap;word-break:break-word;
+  background:var(--panel2);border:1px solid var(--line);border-radius:13px;
+  padding:14px 15px;font-family:'JetBrains Mono',monospace;
+  font-size:12.5px;line-height:1.7;color:var(--text-soft);
+}
+.output-wrap{display:flex;gap:8px;align-items:stretch}
+.output-wrap .output{flex:1;min-width:0}
+.copy-btn{
+  border:1px solid var(--line);background:var(--panel2);color:var(--text-soft);
+  border-radius:13px;padding:0 15px;cursor:pointer;font-weight:600;font-size:12px;
+  min-width:80px;transition:.2s;font-family:inherit;
+}
+.copy-btn:hover{border-color:var(--accent);color:var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent)}
+
+.notice{padding:13px 16px;border:1px solid var(--line);border-radius:13px;background:var(--panel2);color:var(--text-soft);font-size:13px;line-height:1.65;margin-bottom:18px}
+.hidden{display:none!important}
+
+button.primary,button.secondary{border:0;border-radius:13px;padding:12px 22px;cursor:pointer;font-weight:600;font-size:14px;transition:.2s ease;font-family:inherit;letter-spacing:-.01em}
+button.primary{color:#fff;background:linear-gradient(120deg,var(--accent),var(--accent2));box-shadow:0 10px 26px rgba(224,90,58,.32)}
+button.primary:hover:not(:disabled){transform:translateY(-2px);box-shadow:0 16px 32px rgba(224,90,58,.42)}
+button.secondary{background:var(--panel2);color:var(--text);border:1px solid var(--line)}
+button.secondary:hover:not(:disabled){border-color:var(--line2);transform:translateY(-2px);background:var(--panel)}
+button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
+
+.controls3{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin:8px 0 6px}
+.helper,.status{color:var(--muted);font-size:12.5px;line-height:1.65}
+.status{margin-top:12px;min-height:18px}
+.gen-panel{margin-top:18px}
+
+.bl-form{display:grid;grid-template-columns:1fr 1fr auto auto;gap:12px;align-items:end}
+.bl-field label{display:block;color:var(--muted);font-size:10.5px;font-weight:700;letter-spacing:1.6px;margin:0 0 8px}
+.bl-status{margin-top:16px;color:var(--text-soft);font-size:13px;line-height:1.65}
+.bl-health{display:flex;gap:18px;flex-wrap:wrap;margin-top:12px;font-size:12px;color:var(--muted)}
+.bl-health b{color:var(--text);font-weight:600}
+.bl-progress{height:7px;border-radius:99px;background:var(--panel2);overflow:hidden;margin-top:16px;border:1px solid var(--line)}
+.bl-progress-bar{height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--accent2),var(--accent3));transition:width .3s ease}
+
+.bl-summary{display:grid;grid-template-columns:repeat(7,1fr);gap:12px;margin-top:20px}
+.bl-summary-item{padding:18px 12px;border:1px solid var(--line);border-radius:16px;background:var(--panel);text-align:center;box-shadow:var(--shadow)}
+.bl-summary-item b{display:block;font-size:24px;margin-bottom:4px;letter-spacing:-.04em;font-weight:700}
+.bl-summary-item span{color:var(--muted);font-size:10.5px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase}
+
+.bl-table-wrap{margin-top:20px;overflow:auto;border:1px solid var(--line);border-radius:18px;max-height:660px;box-shadow:var(--shadow)}
+.bl-table{width:100%;min-width:1040px;border-collapse:collapse;background:var(--panel)}
+.bl-table thead th{position:sticky;top:0;z-index:2;background:var(--panel2);color:var(--muted);font-size:10.5px;letter-spacing:1.2px;text-transform:uppercase;font-weight:700;padding:14px 12px;border-bottom:1px solid var(--line);text-align:center}
+.bl-table td{padding:11px 12px;border-bottom:1px solid var(--line);font-size:12.5px;text-align:center;vertical-align:middle}
+.bl-table tbody tr:hover td{background:var(--panel2)}
+.bl-table tbody tr:last-child td{border-bottom:0}
+.ip-cell,.rdns-cell{text-align:left!important;font-family:'JetBrains Mono',monospace;font-size:11.5px!important}
+.bl-status-pill{display:inline-block;padding:3px 10px;border-radius:99px;font-size:10px;font-weight:700;letter-spacing:.4px;border:1px solid transparent}
+.bl-ok{color:var(--ok);background:color-mix(in srgb,var(--ok) 13%,transparent);border-color:color-mix(in srgb,var(--ok) 30%,transparent)}
+.bl-listed{color:var(--danger);background:color-mix(in srgb,var(--danger) 13%,transparent);border-color:color-mix(in srgb,var(--danger) 30%,transparent)}
+.bl-error{color:var(--warn);background:color-mix(in srgb,var(--warn) 15%,transparent);border-color:color-mix(in srgb,var(--warn) 32%,transparent)}
+.bl-na{color:var(--muted);background:var(--panel2);border-color:var(--line)}
+.bl-total td{background:var(--panel2);font-weight:700;border-top:2px solid var(--line2)}
+.bl-dbl-domain{display:block;margin-top:5px;color:var(--muted);font-size:10.5px;word-break:break-all}
+
+.footer{text-align:center;color:var(--muted);font-size:12px;padding:48px 0 28px;letter-spacing:.02em}
+
+.toasts{position:fixed;right:18px;bottom:18px;z-index:100;display:flex;flex-direction:column;gap:10px}
+.toast{padding:13px 18px;border-radius:14px;font-size:13px;font-weight:600;background:var(--panel);border:1px solid var(--line);color:var(--text);box-shadow:var(--shadow-lg);animation:toastIn .3s ease;max-width:340px}
+.toast.ok{border-color:color-mix(in srgb,var(--ok) 45%,transparent)}
+.toast.err{border-color:color-mix(in srgb,var(--danger) 45%,transparent)}
+@keyframes toastIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
+
+.session-banner{
+  position:fixed;top:14px;left:50%;transform:translateX(-50%);
+  z-index:200;padding:9px 16px;border-radius:99px;
+  background:var(--panel);border:1px solid var(--line);color:var(--muted);
+  font-size:12px;font-weight:600;box-shadow:var(--shadow);display:none;
+}
+.session-banner.show{display:block;animation:toastIn .3s ease}
+.session-banner b{color:var(--accent)}
+
+@media(max-width:980px){
+  .home-hero{grid-template-columns:1fr;padding:18px 4px 30px;gap:28px}
+  .bento{grid-template-columns:1fr 1fr;grid-template-rows:auto}
+  .bento-card.big,.bento-card.tall,.bento-card.wide{grid-column:auto;grid-row:auto}
+  .bento-card.big{grid-column:1/3}
+  .workspace,.controls3{grid-template-columns:1fr}
+  .bl-form{grid-template-columns:1fr}
+  .bl-summary{grid-template-columns:repeat(3,1fr)}
+}
+@media(max-width:640px){
+  .app{padding:14px 14px 0}
+  .topbar{position:static}
+  .nav{width:100%}
+  .nav button{flex:1 1 auto}
+  .stats-strip{grid-template-columns:repeat(2,1fr)}
+  .bento{grid-template-columns:1fr}
+  .bento-card.big,.bento-card.wide{grid-column:auto}
+  .bl-summary{grid-template-columns:repeat(2,1fr)}
+  .output-wrap{flex-direction:column}
+  .copy-btn{padding:11px;width:100%}
+}
+</style>
+</head>
+<body>
+<div class="bg-orbs"><span></span><span></span><span></span></div>
+<div id="session-banner" class="session-banner">Session expires in <b id="session-countdown">10:00</b></div>
+
+<div class="app">
+  <header class="topbar">
+    <div class="brand" onclick="showPage('home')">
+      <svg viewBox="0 0 64 64" aria-hidden="true">
+        <defs><linearGradient id="lg" x1="0" x2="1" y1="0" y2="1">
+          <stop stop-color="#e05a3a"/><stop offset=".5" stop-color="#e89b3c"/><stop offset="1" stop-color="#d94a7a"/>
+        </linearGradient></defs>
+        <path d="M32 5 55 18v28L32 59 9 46V18z" fill="none" stroke="url(#lg)" stroke-width="3.5" stroke-linejoin="round"/>
+        <text x="32" y="40" text-anchor="middle" font-family="Outfit,sans-serif" font-size="20" font-weight="700" fill="url(#lg)">{U}</text>
+      </svg>
+      <div><b>Email journeys</b><span>ENCODE • DECODE • GENERATE • HUNT</span></div>
+    </div>
+    <nav class="nav">
+      <button id="nav-home" onclick="showPage('home')">Home</button>
+      <button id="nav-converter" onclick="showPage('converter')">Converter</button>
+      <button id="nav-generator" onclick="showPage('generator')">Generators</button>
+      <button id="nav-blocklist" onclick="showPage('blocklist')">Blocklist</button>
+      <button id="nav-hunter" onclick="showPage('hunter')">Email Hunter</button>
+      <button class="icon-btn" id="theme-btn" onclick="toggleTheme()" title="Toggle theme">☾</button>
+      <button class="logout" onclick="logoutUser()">Logout</button>
+    </nav>
+  </header>
+
+  <!-- ================= HOME ================= -->
+  <section id="home" class="page active">
+    <div class="home-hero">
+      <div class="hero-left">
+        <span class="pill"><span class="dot"></span>Email Toolkit · v3</span>
+        <h1>Every email journey, <span class="swipe">decoded right</span>.</h1>
+        <p class="lede">Encode and decode UTF-8 Q and Base64 subject lines, generate random sender identities, verify your sending IPs against every major blocklist, and hunt publicly available emails on any website — one workspace for the people who ship email.</p>
+        <div class="hero-cta">
+          <button class="primary" onclick="showPage('converter');setMode('encode')">Start Encoding</button>
+          <button class="secondary" onclick="showPage('hunter')">Hunt Emails</button>
+        </div>
+        <div class="micro-stats">
+          <div><b>3</b><span>Q methods</span></div>
+          <div><b>2</b><span>Base64 modes</span></div>
+          <div><b>4</b><span>DNS blocklists</span></div>
+          <div><b>120s</b><span>Hunt window</span></div>
+        </div>
+      </div>
+      <div class="hero-right">
+        <div class="preview-window">
+          <div class="window-bar">
+            <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+            <b>email-journey.live</b>
+          </div>
+          <div class="window-body">
+            <div class="win-line"><span class="win-tag tag-in">IN</span><span class="win-text">Your order has shipped 🎉</span></div>
+            <div class="win-line"><span class="win-tag tag-q1">Q1</span><span class="win-text">=?UTF-8?Q?Your_order_has_shipped_=F0=9F=8E=89?=</span></div>
+            <div class="win-line"><span class="win-tag tag-q2">Q2</span><span class="win-text">=?UTF-8?Q?Y=6Eur_=6Frder_has_sh=69pped_=F0=9F=8E=89?=</span></div>
+            <div class="win-line"><span class="win-tag tag-b64">B64</span><span class="win-text">WW91ciBvcmRlciBoYXMgc2hpcHBlZCDwn46J</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="stats-strip">
+      <div><b>99.9%</b><span>Decode accuracy</span></div>
+      <div><b>1024</b><span>IPs per check</span></div>
+      <div><b>24</b><span>Parallel workers</span></div>
+      <div><b>0</b><span>Third-party JS</span></div>
+    </div>
+
+    <div class="bento">
+      <div class="bento-card big">
+        <div class="bic">✉️</div>
+        <h3>UTF-8 Q Encoding — three flavours</h3>
+        <p>Method&nbsp;1 uses fixed quoted-printable for full safety. Method&nbsp;2 mixes plain and encoded characters. Method&nbsp;3 splits subject lines into random chunks and interleaves Q and Base64 words for maximum obfuscation.</p>
+        <button class="baa" onclick="showPage('converter');setMode('encode')">Open converter</button>
+      </div>
+      <div class="bento-card tall">
+        <div class="bic">🧬</div>
+        <h3>Smart Decoding</h3>
+        <p>Paste any Q or Base64 encoded-word from a raw email and the app detects the format automatically — then strips invisible formatting characters like ZWSP, ZWNJ and BOM from the result.</p>
+        <button class="baa" onclick="showPage('converter');setMode('decode')">Open decoder</button>
+      </div>
+      <div class="bento-card">
+        <div class="bic">🎲</div>
+        <h3>Random Generators</h3>
+        <p>Secure strings, pronounceable words and brandable sender names.</p>
+        <button class="baa" onclick="showPage('generator')">Open generators</button>
+      </div>
+      <div class="bento-card wide">
+        <div class="bic">🛡️</div>
+        <h3>Bulk Blocklist Check</h3>
+        <p>Query up to 1,024 IPv4 addresses at once against Spamhaus ZEN (CSS / PBL / SBL / XBL) and Barracuda, then resolve RDNS and its registered domain against Spamhaus DBL. Export the whole table to CSV in one click.</p>
+        <button class="baa" onclick="showPage('blocklist')">Open blocklist</button>
+      </div>
+      <div class="bento-card" style="grid-column:1/4;grid-row:3">
+        <div class="bic">🔍</div>
+        <h3>Email Hunter</h3>
+        <p>Enter any website URL. The hunter recursively crawls the site's public internal pages for up to 2 minutes, extracts every publicly available email (plain, <code>mailto:</code>, and obfuscated as <code>name [at] example [dot] com</code>), removes duplicates, and shows you the results with full crawl statistics.</p>
+        <button class="baa" onclick="showPage('hunter')">Open Email Hunter</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= CONVERTER ================= -->
+  <section id="converter" class="page">
+    <div class="section-head">
+      <div><h2>UTF-8 &amp; Base64 Converter</h2><p>Switch between Encode and Decode. Format detection on decode is automatic.</p></div>
+    </div>
+    <div class="tabs">
+      <button id="encode-tab" class="tab active" onclick="setMode('encode')">Encode</button>
+      <button id="decode-tab" class="tab" onclick="setMode('decode')">Decode</button>
+    </div>
+
+    <div id="encode-panel">
+      <div class="workspace">
+        <div class="card">
+          <h3>Input</h3>
+          <label class="label" for="enc-input">Plain text</label>
+          <textarea id="enc-input" placeholder="Type or paste the text you want to encode…"></textarea>
+          <div class="actions">
+            <button class="primary" onclick="encodeText()">Convert</button>
+            <button class="secondary" onclick="clearBox('enc-input')">Clear</button>
+          </div>
+        </div>
+        <div class="card">
+          <h3>UTF-8 Q Outputs</h3>
+          <div class="result"><label class="label">Q Method 1</label>
+            <div class="output-wrap"><div id="q1" class="output"></div><button class="copy-btn" onclick="copyText('q1',this)">Copy</button></div></div>
+          <div class="result"><label class="label">Q Method 2</label>
+            <div class="output-wrap"><div id="q2" class="output"></div><button class="copy-btn" onclick="copyText('q2',this)">Copy</button></div></div>
+          <div class="result"><label class="label">Q Method 3</label>
+            <div class="output-wrap"><div id="q3" class="output"></div><button class="copy-btn" onclick="copyText('q3',this)">Copy</button></div></div>
+        </div>
+      </div>
+      <div class="card" style="margin-top:18px">
+        <h3>Base64 Outputs</h3>
+        <div class="workspace">
+          <div><label class="label">Standard Base64</label>
+            <div class="output-wrap"><div id="b64" class="output"></div><button class="copy-btn" onclick="copyText('b64',this)">Copy</button></div></div>
+          <div><label class="label">Underscore Base64</label>
+            <div class="output-wrap"><div id="b64u" class="output"></div><button class="copy-btn" onclick="copyText('b64u',this)">Copy</button></div></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="decode-panel" class="hidden">
+      <div class="notice">Paste any UTF-8 Q or Base64 encoded-word. The format is detected automatically and invisible characters are removed from the result.</div>
+      <div class="card">
+        <h3>Decode</h3>
+        <label class="label" for="dec-input">Encoded input</label>
+        <textarea id="dec-input" placeholder="=?UTF-8?Q?Hello_World?="></textarea>
+        <div class="actions">
+          <button class="primary" onclick="decodeText()">Decode</button>
+          <button class="secondary" onclick="clearDecode()">Clear</button>
+        </div>
+        <div class="result"><label class="label">Detected format</label><div id="detected" class="output" style="min-height:56px"></div></div>
+        <div class="result"><label class="label">Output</label>
+          <div class="output-wrap"><div id="dec-output" class="output" style="min-height:110px"></div><button class="copy-btn" onclick="copyText('dec-output',this)">Copy</button></div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= GENERATORS ================= -->
+  <section id="generator" class="page">
+    <div class="section-head">
+      <div><h2>Random Generators</h2><p>Cryptographically strong strings, pronounceable random words, and brandable names.</p></div>
+    </div>
+    <div class="tabs">
+      <button id="gen-string-tab" class="tab active" onclick="genTab('string')">String Generator</button>
+      <button id="gen-word-tab" class="tab" onclick="genTab('word')">Random Words</button>
+      <button id="gen-name-tab" class="tab" onclick="genTab('name')">Name Generator</button>
+    </div>
+
+    <div id="gen-string" class="card gen-panel">
+      <h3>Random String Generator</h3>
+      <p class="helper">Uppercase, lowercase and digits — generated with a cryptographically secure RNG.</p>
+      <div class="controls3">
+        <div><label class="label" for="stringMin">Min length</label><input id="stringMin" type="number" value="10" min="1" max="10000"></div>
+        <div><label class="label" for="stringMax">Max length</label><input id="stringMax" type="number" value="20" min="1" max="10000"></div>
+        <div><label class="label" for="stringCount">Results</label><input id="stringCount" type="number" value="10" min="1" max="100"></div>
+      </div>
+      <div class="actions">
+        <button class="primary" onclick="generateStrings()">Generate</button>
+        <button class="secondary" onclick="copyArea('stringOut',this)">Copy All</button>
+        <button class="secondary" onclick="clearArea('stringOut')">Clear</button>
+      </div>
+      <label class="label" for="stringOut">Output</label>
+      <textarea id="stringOut" readonly placeholder="Results appear here…"></textarea>
+      <div id="stringStatus" class="status"></div>
+    </div>
+
+    <div id="gen-word" class="card gen-panel hidden">
+      <h3>Random Words Generator</h3>
+      <p class="helper">Natural-looking words built from alternating consonants and vowels.</p>
+      <div class="controls3">
+        <div><label class="label" for="wordMin">Min length</label><input id="wordMin" type="number" value="8" min="1" max="10000"></div>
+        <div><label class="label" for="wordMax">Max length</label><input id="wordMax" type="number" value="20" min="1" max="10000"></div>
+        <div><label class="label" for="wordCount">Results</label><input id="wordCount" type="number" value="10" min="1" max="1000"></div>
+      </div>
+      <div class="actions">
+        <button class="primary" onclick="generateWords()">Generate</button>
+        <button class="secondary" onclick="copyArea('wordOut',this)">Copy All</button>
+        <button class="secondary" onclick="clearArea('wordOut')">Clear</button>
+      </div>
+      <label class="label" for="wordOut">Output</label>
+      <textarea id="wordOut" readonly placeholder="Results appear here…"></textarea>
+      <div id="wordStatus" class="status"></div>
+    </div>
+
+    <div id="gen-name" class="card gen-panel hidden">
+      <h3>Name Generator</h3>
+      <p class="helper">Each result joins 2 or 3 parts with <code>-</code>, <code>.</code> or <code>_</code>.</p>
+      <div class="controls3">
+        <div><label class="label" for="nameCount">Results</label><input id="nameCount" type="number" value="10" min="1" max="1000"></div>
+      </div>
+      <div class="actions">
+        <button class="primary" onclick="generateNames()">Generate</button>
+        <button class="secondary" onclick="copyArea('nameOut',this)">Copy All</button>
+        <button class="secondary" onclick="clearArea('nameOut')">Clear</button>
+      </div>
+      <label class="label" for="nameOut">Output</label>
+      <textarea id="nameOut" readonly placeholder="Results appear here…"></textarea>
+      <div id="nameStatus" class="status"></div>
+    </div>
+  </section>
+
+  <!-- ================= BLOCKLIST ================= -->
+  <section id="blocklist" class="page">
+    <div class="section-head">
+      <div>
+        <h2>Bulk Blocklist Check</h2>
+        <p>Check an IPv4 range against Spamhaus ZEN (CSS / PBL / SBL / XBL) and Barracuda, then resolve RDNS and test its registered domain against Spamhaus DBL. LISTED means a recognized listing response was found — otherwise the result is N/A.</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="bl-form">
+        <div class="bl-field">
+          <label for="bl-first-ip">First IP address</label>
+          <input id="bl-first-ip" type="text" placeholder="66.78.52.2" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="bl-field">
+          <label for="bl-last-ip">Last IP address</label>
+          <input id="bl-last-ip" type="text" placeholder="66.78.52.254" autocomplete="off" spellcheck="false">
+        </div>
+        <button class="primary" id="bl-check-btn" onclick="checkBlocklist()">Check Range</button>
+        <button class="secondary" id="bl-cancel-btn" onclick="cancelBlocklist()" disabled>Cancel</button>
+      </div>
+      <div id="bl-status" class="bl-status">Maximum 1,024 IP addresses per check.</div>
+      <div id="bl-health" class="bl-health"></div>
+      <div class="bl-progress hidden" id="bl-progress"><div class="bl-progress-bar" id="bl-progress-bar"></div></div>
+      <div class="actions" id="bl-export-wrap" style="display:none">
+        <button class="secondary" onclick="exportBlocklistCsv()">Export CSV</button>
+      </div>
+    </div>
+
+    <div id="bl-summary" class="bl-summary hidden"></div>
+
+    <div id="bl-results" class="bl-table-wrap hidden">
+      <table class="bl-table">
+        <thead><tr><th>IP</th><th>CSS</th><th>PBL</th><th>SBL</th><th>Barracuda</th><th>RDNS</th><th>DBL</th></tr></thead>
+        <tbody id="bl-tbody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ================= EMAIL HUNTER ================= -->
+  <section id="hunter" class="page">
+    <div class="section-head">
+      <div>
+        <h2>Email Hunter</h2>
+        <p>Enter a website URL. We'll crawl its public internal pages for up to 2 minutes, extract every publicly available email (including obfuscated ones), remove duplicates, and show the results.</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <label class="label" for="hunter-url">Website URL</label>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <input id="hunter-url" type="text" placeholder="https://example.com" autocomplete="off" spellcheck="false" style="flex:1;min-width:240px">
+        <button class="primary" id="hunter-btn" onclick="startEmailHunter()">Start Crawl</button>
+        <button class="secondary" id="hunter-cancel" onclick="cancelEmailHunter()" disabled>Cancel</button>
+      </div>
+      <div id="hunter-status" class="status" style="margin-top:14px"></div>
+      <div class="bl-progress hidden" id="hunter-progress" style="margin-top:6px">
+        <div class="bl-progress-bar" id="hunter-progress-bar" style="width:8%"></div>
+      </div>
+    </div>
+
+    <div id="hunter-stats" class="bl-summary hidden" style="margin-top:20px"></div>
+
+    <div class="card" id="hunter-emails-card" style="margin-top:20px;display:none">
+      <h3>Emails Found (<span id="hunter-count">0</span>)</h3>
+      <div class="actions" style="margin-top:0;margin-bottom:12px">
+        <button class="secondary" onclick="copyHunterEmails(this)">Copy All</button>
+        <button class="secondary" onclick="exportHunterCsv()">Export CSV</button>
+      </div>
+      <div id="hunter-emails" class="output" style="min-height:80px;max-height:520px;overflow:auto"></div>
+    </div>
+  </section>
+
+  <div class="footer">Email journeys · Embedded logo, favicon and BIMI endpoint · <span id="year"></span></div>
+</div>
+
+<div id="toasts" class="toasts"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const PAGES = ['home', 'converter', 'generator', 'blocklist', 'hunter'];
+const state = { blAbort: null, blData: null };
+
+/* ============================================================
+   Session timeout — 10 minutes, absolute
+   ============================================================ */
+const SESSION_MAX_AGE_MS = 10 * 60 * 1000;
+const SESSION_START_KEY = 'ej_session_start';
+const SESSION_BANNER_DELAY_MS = 8 * 60 * 1000;
+
+function sessionStart() {
+  let t = parseInt(sessionStorage.getItem(SESSION_START_KEY) || '0', 10);
+  if (!t || Date.now() - t > SESSION_MAX_AGE_MS) {
+    t = Date.now();
+    sessionStorage.setItem(SESSION_START_KEY, String(t));
+  }
+  return t;
+}
+
+function checkSession() {
+  const elapsed = Date.now() - sessionStart();
+  if (elapsed >= SESSION_MAX_AGE_MS) {
+    sessionStorage.removeItem(SESSION_START_KEY);
+    window.location.href = '/login?expired=1';
+    return false;
+  }
+  return true;
+}
+
+function updateSessionBanner() {
+  const banner = $('session-banner');
+  const label = $('session-countdown');
+  const elapsed = Date.now() - sessionStart();
+  const remaining = Math.max(0, SESSION_MAX_AGE_MS - elapsed);
+  if (remaining <= SESSION_MAX_AGE_MS - SESSION_BANNER_DELAY_MS && remaining > 0) {
+    const m = String(Math.floor(remaining / 60000)).padStart(1, '0');
+    const s = String(Math.floor((remaining % 60000) / 1000)).padStart(2, '0');
+    label.textContent = m + ':' + s;
+    banner.classList.add('show');
+  } else {
+    banner.classList.remove('show');
+  }
+}
+
+sessionStart();
+setInterval(function () {
+  if (!checkSession()) return;
+  updateSessionBanner();
+}, 1000);
+
+/* ============================================================
+   Navigation & theme
+   ============================================================ */
+function showPage(name) {
+  if (!checkSession()) return;
+  PAGES.forEach((p) => $(p).classList.toggle('active', p === name));
+  document.querySelectorAll('.nav button[id^="nav-"]').forEach((b) => b.classList.remove('active'));
+  const btn = $('nav-' + name);
+  if (btn) btn.classList.add('active');
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+  if (name === 'blocklist') refreshHealth();
+}
+
+function setMode(mode) {
+  showPage('converter');
+  $('encode-panel').classList.toggle('hidden', mode !== 'encode');
+  $('decode-panel').classList.toggle('hidden', mode !== 'decode');
+  $('encode-tab').classList.toggle('active', mode === 'encode');
+  $('decode-tab').classList.toggle('active', mode === 'decode');
+}
+
+function genTab(mode) {
+  ['string', 'word', 'name'].forEach((x) => {
+    $('gen-' + x).classList.toggle('hidden', x !== mode);
+    $('gen-' + x + '-tab').classList.toggle('active', x === mode);
+  });
+}
+
+function toggleTheme() {
+  const dark = document.body.classList.toggle('dark');
+  localStorage.setItem('theme', dark ? 'dark' : 'light');
+  $('theme-btn').textContent = dark ? '☀' : '☾';
+}
+(function initTheme() {
+  const saved = localStorage.getItem('theme');
+  const dark = saved === 'dark';
+  document.body.classList.toggle('dark', dark);
+  $('theme-btn').textContent = dark ? '☀' : '☾';
+})();
+
+function logoutUser() {
+  sessionStorage.removeItem(SESSION_START_KEY);
+  window.location.href = '/logout';
+}
+
+/* ============================================================
+   Toasts + clipboard
+   ============================================================ */
+function toast(message, kind) {
+  const el = document.createElement('div');
+  el.className = 'toast ' + (kind || '');
+  el.textContent = message;
+  $('toasts').appendChild(el);
+  setTimeout(() => {
+    el.style.transition = 'opacity .25s, transform .25s';
+    el.style.opacity = '0';
+    el.style.transform = 'translateY(10px)';
+    setTimeout(() => el.remove(), 260);
+  }, 2600);
+}
+
+function legacyCopy(value) {
+  const ta = document.createElement('textarea');
+  ta.value = value;
+  ta.setAttribute('readonly', '');
+  ta.style.position = 'fixed';
+  ta.style.top = '-1000px';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  ta.setSelectionRange(0, value.length);
+  document.execCommand('copy');
+  document.body.removeChild(ta);
+}
+
+async function writeClipboard(value) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  legacyCopy(value);
+}
+
+async function copyValue(value, btn) {
+  if (!value) { toast('Nothing to copy', 'err'); return; }
+  try {
+    await writeClipboard(value);
+    if (btn) {
+      const old = btn.textContent;
+      btn.textContent = 'Copied';
+      setTimeout(() => { btn.textContent = old; }, 1000);
+    }
+    toast('Copied to clipboard', 'ok');
+  } catch (e) {
+    toast('Clipboard access failed', 'err');
+  }
+}
+
+function copyText(id, btn) { copyValue($(id).textContent, btn); }
+function copyArea(id, btn) { copyValue($(id).value, btn); }
+function clearBox(id) { $(id).value = ''; }
+function clearArea(id) { $(id).value = ''; }
+function clearDecode() {
+  $('dec-input').value = '';
+  $('dec-output').textContent = '';
+  $('detected').textContent = '';
+}
+
+/* ============================================================
+   API helper
+   ============================================================ */
+async function api(url, opts) {
+  const res = await fetch(url, opts);
+  if (res.status === 401) {
+    sessionStorage.removeItem(SESSION_START_KEY);
+    window.location.href = '/login?expired=1';
+    throw new Error('Session expired');
+  }
+  const text = await res.text();
+  let data;
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch (e) {
+    throw new Error('Server returned non-JSON (HTTP ' + res.status + ')');
+  }
+  if (!res.ok) throw new Error(data.error || ('Request failed (HTTP ' + res.status + ')'));
+  return data;
+}
+
+/* ============================================================
+   Converter
+   ============================================================ */
+async function encodeText() {
+  const text = $('enc-input').value;
+  if (!text) {
+    ['q1', 'q2', 'q3', 'b64', 'b64u'].forEach((x) => { $(x).textContent = ''; });
+    return;
+  }
+  try {
+    const d = await api('/api/encode', {
+      method: 'POST',
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' },
+      body: JSON.stringify({ text: text, _nonce: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())) })
+    });
+    $('q1').textContent = d.q1;
+    $('q2').textContent = d.q2;
+    $('q3').textContent = d.q3;
+    $('b64').textContent = d.base64;
+    $('b64u').textContent = d.base64_underscore;
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function decodeText() {
+  const value = $('dec-input').value.trim();
+  if (!value) { toast('Enter encoded text first', 'err'); return; }
+  try {
+    const d = await api('/api/decode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: value })
+    });
+    $('detected').textContent = d.detected;
+    $('dec-output').textContent = d.output;
+  } catch (e) {
+    $('detected').textContent = '';
+    $('dec-output').textContent = 'Error: ' + e.message;
+    toast(e.message, 'err');
+  }
+}
+
+/* ============================================================
+   Generators
+   ============================================================ */
+function readRange(a, b) {
+  let x = Math.max(1, Math.min(parseInt($(a).value, 10) || 1, 10000));
+  let y = Math.max(1, Math.min(parseInt($(b).value, 10) || 20, 10000));
+  return x > y ? [y, x] : [x, y];
+}
+
+async function generateStrings() {
+  const range = readRange('stringMin', 'stringMax');
+  const count = Math.max(1, Math.min(parseInt($('stringCount').value, 10) || 10, 100));
+  try {
+    const d = await api('/api/random/data', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: 'string', min: range[0], max: range[1], count: count })
+    });
+    $('stringOut').value = d.results.join('\n');
+    $('stringStatus').textContent = d.results.length + ' strings generated';
+  } catch (e) { $('stringStatus').textContent = e.message; toast(e.message, 'err'); }
+}
+
+async function generateWords() {
+  const range = readRange('wordMin', 'wordMax');
+  const count = Math.max(1, Math.min(parseInt($('wordCount').value, 10) || 10, 1000));
+  try {
+    const d = await api('/api/random/data', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: 'words', min: range[0], max: range[1], count: count })
+    });
+    $('wordOut').value = d.results.join('\n');
+    $('wordStatus').textContent = d.results.length + ' random words generated';
+  } catch (e) { $('wordStatus').textContent = e.message; toast(e.message, 'err'); }
+}
+
+async function generateNames() {
+  const count = Math.max(1, Math.min(parseInt($('nameCount').value, 10) || 10, 1000));
+  try {
+    const d = await api('/api/random/names', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ count: count })
+    });
+    $('nameOut').value = d.results.join('\n');
+    $('nameStatus').textContent = d.results.length + ' names generated';
+  } catch (e) { $('nameStatus').textContent = e.message; toast(e.message, 'err'); }
+}
+
+/* ============================================================
+   Blocklist
+   ============================================================ */
+function esc(v) {
+  return String(v === null || v === undefined ? '' : v).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
+function pill(v) {
+  const s = String(v || 'N/A').toUpperCase();
+  if (s === 'LISTED') return '<span class="bl-status-pill bl-listed">LISTED</span>';
+  if (s === 'OK') return '<span class="bl-status-pill bl-ok">OK</span>';
+  if (s === 'ERROR') return '<span class="bl-status-pill bl-error">ERROR</span>';
+  return '<span class="bl-status-pill bl-na">N/A</span>';
+}
+
+async function refreshHealth() {
+  try {
+    const d = await api('/api/blocklist/health', { method: 'GET' });
+    const color = d.spamhaus_ok ? 'var(--ok)' : 'var(--danger)';
+    $('bl-health').innerHTML =
+      'Resolver: <b>' + esc((d.nameservers || []).join(', ') || 'system') + '</b>' +
+      ' · Backend: <b>' + esc(d.dns_backend) + '</b>' +
+      ' · DQS: <b>' + (d.dqs ? 'ON' : 'OFF') + '</b>' +
+      ' · <span style="color:' + color + '">Spamhaus: <b>' + (d.spamhaus_ok ? 'OK' : 'BLOCKED') + '</b></span>' +
+      (d.spamhaus_note ? ' — ' + esc(d.spamhaus_note) : '');
+  } catch (e) {
+    $('bl-health').textContent = 'Health check failed: ' + e.message;
+  }
+}
+
+function renderSummary(t) {
+  const items = [
+    ['Total', t.total], ['CSS', t.css], ['PBL', t.pbl], ['SBL', t.sbl],
+    ['Barracuda', t.barracuda], ['RDNS', t.rdns], ['DBL', t.dbl]
+  ];
+  $('bl-summary').innerHTML = items.map(function (x) {
+    return '<div class="bl-summary-item"><b>' + esc(x[1]) + '</b><span>' + esc(x[0]) + '</span></div>';
+  }).join('');
+  $('bl-summary').classList.remove('hidden');
+}
+
+function renderResults(rows, totals) {
+  const body = rows.map(function (r) {
+    const domain = (r.dbl_domain && r.dbl_domain !== '-')
+      ? '<span class="bl-dbl-domain">' + esc(r.dbl_domain) + '</span>' : '';
+    const rdns = (r.rdns === '-')
+      ? '<span class="bl-status-pill bl-na">No PTR</span>' : esc(r.rdns);
+    return '<tr>' +
+      '<td class="ip-cell">' + esc(r.ip) + '</td>' +
+      '<td>' + pill(r.css) + '</td>' +
+      '<td>' + pill(r.pbl) + '</td>' +
+      '<td>' + pill(r.sbl) + '</td>' +
+      '<td>' + pill(r.barracuda) + '</td>' +
+      '<td class="rdns-cell">' + rdns + '</td>' +
+      '<td>' + pill(r.dbl) + domain + '</td>' +
+      '</tr>';
+  }).join('');
+
+  const totalRow = '<tr class="bl-total">' +
+    '<td class="ip-cell">Total</td>' +
+    '<td>' + esc(totals.css) + '</td>' +
+    '<td>' + esc(totals.pbl) + '</td>' +
+    '<td>' + esc(totals.sbl) + '</td>' +
+    '<td>' + esc(totals.barracuda) + '</td>' +
+    '<td>' + esc(totals.rdns) + '</td>' +
+    '<td>' + esc(totals.dbl) + '</td>' +
+    '</tr>';
+
+  $('bl-tbody').innerHTML = body + totalRow;
+  $('bl-results').classList.remove('hidden');
+}
+
+async function checkBlocklist() {
+  const first = $('bl-first-ip').value.trim();
+  const last = $('bl-last-ip').value.trim();
+  const btn = $('bl-check-btn');
+  const cancelBtn = $('bl-cancel-btn');
+  const status = $('bl-status');
+  const progress = $('bl-progress');
+  const bar = $('bl-progress-bar');
+
+  if (!first || !last) {
+    status.textContent = 'Enter both the First IP address and the Last IP address.';
+    toast('Both IP fields are required', 'err');
+    return;
+  }
+
+  state.blAbort = new AbortController();
+  const startedAt = Date.now();
+  const tick = setInterval(function () {
+    status.textContent = 'Checking ' + first + ' → ' + last + '… ' +
+      ((Date.now() - startedAt) / 1000).toFixed(0) + 's';
+  }, 1000);
+
+  btn.disabled = true;
+  btn.textContent = 'Checking…';
+  cancelBtn.disabled = false;
+  status.textContent = 'Checking ' + first + ' → ' + last + '…';
+  progress.classList.remove('hidden');
+  bar.style.width = '8%';
+  $('bl-results').classList.add('hidden');
+  $('bl-summary').classList.add('hidden');
+  $('bl-export-wrap').style.display = 'none';
+  state.blData = null;
+
+  try {
+    const d = await api('/api/blocklist/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ first_ip: first, last_ip: last }),
+      signal: state.blAbort.signal
+    });
+    bar.style.width = '100%';
+    state.blData = d;
+    renderSummary(d.totals);
+    renderResults(d.results, d.totals);
+    $('bl-export-wrap').style.display = 'flex';
+
+    let msg = 'Completed ' + d.results.length + ' IP checks in ' + d.elapsed + 's.';
+    if (d.errors) msg += ' ' + d.errors + ' row(s) returned a provider error.';
+    if (d.warning) msg += ' ' + d.warning;
+    status.textContent = msg;
+  } catch (e) {
+    if (e && e.name === 'AbortError') {
+      status.textContent = 'Check cancelled.';
+    } else {
+      status.textContent = e.message || 'Blocklist check failed.';
+      toast(e.message || 'Blocklist check failed.', 'err');
+    }
+    $('bl-results').classList.add('hidden');
+    $('bl-summary').classList.add('hidden');
+    $('bl-export-wrap').style.display = 'none';
+  } finally {
+    clearInterval(tick);
+    state.blAbort = null;
+    btn.disabled = false;
+    btn.textContent = 'Check Range';
+    cancelBtn.disabled = true;
+    setTimeout(function () { progress.classList.add('hidden'); bar.style.width = '0%'; }, 700);
+  }
+}
+
+function cancelBlocklist() { if (state.blAbort) state.blAbort.abort(); }
+
+function exportBlocklistCsv() {
+  if (!state.blData || !state.blData.results) { toast('Nothing to export', 'err'); return; }
+  const header = ['IP', 'CSS', 'PBL', 'SBL', 'Barracuda', 'RDNS', 'DBL_Domain', 'DBL'];
+  const lines = [header.join(',')];
+  state.blData.results.forEach(function (r) {
+    lines.push([
+      r.ip, r.css, r.pbl, r.sbl, r.barracuda, r.rdns,
+      (r.dbl_domain || '-'), r.dbl
+    ].map(function (v) {
+      const s = String(v === null || v === undefined ? '' : v);
+      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    }).join(','));
+  });
+  const blob = new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'blocklist-check.csv';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  toast('CSV exported', 'ok');
+}
+
+/* ============================================================
+   Email Hunter
+   ============================================================ */
+const hunterState = { abort: null, sid: null, pollTimer: null, data: null };
+
+async function startEmailHunter() {
+  const url = $('hunter-url').value.trim();
+  if (!url) { toast('Please enter a URL', 'err'); return; }
+
+  const btn = $('hunter-btn');
+  const cancelBtn = $('hunter-cancel');
+  const status = $('hunter-status');
+  const progress = $('hunter-progress');
+  const bar = $('hunter-progress-bar');
+
+  hunterState.abort = new AbortController();
+  hunterState.data = null;
+  btn.disabled = true;
+  btn.textContent = 'Crawling…';
+  cancelBtn.disabled = false;
+  progress.classList.remove('hidden');
+  bar.style.width = '8%';
+  $('hunter-stats').classList.add('hidden');
+  $('hunter-emails-card').style.display = 'none';
+
+  const startedAt = Date.now();
+  const tick = setInterval(function () {
+    const s = ((Date.now() - startedAt) / 1000).toFixed(0);
+    status.textContent = 'Crawling ' + url + '… ' + s + 's (max 120s)';
+    const pct = Math.min(95, 8 + (s / 120) * 87);
+    bar.style.width = pct.toFixed(1) + '%';
+  }, 1000);
+  status.textContent = 'Starting crawl…';
+
+  try {
+    const d = await api('/api/email-hunter/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: url }),
+      signal: hunterState.abort.signal
+    });
+    hunterState.sid = d.session_id;
+    clearInterval(tick);
+    pollHunterResults(startedAt, tick);
+  } catch (e) {
+    clearInterval(tick);
+    finishHunterUi();
+    if (e.name === 'AbortError') { status.textContent = 'Cancelled.'; }
+    else { status.textContent = e.message; toast(e.message, 'err'); }
+  }
+}
+
+function pollHunterResults(startedAt, tick) {
+  const status = $('hunter-status');
+  hunterState.pollTimer = setInterval(async function () {
+    if (!hunterState.sid) return;
+    try {
+      const d = await api('/api/email-hunter/results/' + hunterState.sid, { method: 'GET' });
+      if (d.status === 'running') return;
+      clearInterval(tick);
+      clearInterval(hunterState.pollTimer);
+      hunterState.pollTimer = null;
+
+      if (d.error) {
+        status.textContent = 'Error: ' + d.error;
+        toast(d.error, 'err');
+        finishHunterUi();
+        return;
+      }
+      hunterState.data = d;
+      displayHunterResults(d);
+      finishHunterUi();
+      $('hunter-progress-bar').style.width = '100%';
+      setTimeout(function () { $('hunter-progress').classList.add('hidden'); }, 600);
+    } catch (e) {
+      clearInterval(tick);
+      clearInterval(hunterState.pollTimer);
+      hunterState.pollTimer = null;
+      status.textContent = e.message;
+      finishHunterUi();
+    }
+  }, 1500);
+}
+
+function displayHunterResults(d) {
+  const s = d.stats || {};
+  const stats = $('hunter-stats');
+  const items = [
+    ['Emails',        s.emails || 0],
+    ['Pages',         s.pages_visited || 0],
+    ['Contact Pages', s.contact_pages || 0],
+    ['Discovered',    s.discovered || 0],
+    ['Visited',       s.visited || 0],
+    ['Errors',        s.errors || 0],
+    ['Time (s)',      s.time_taken || 0],
+  ];
+  stats.innerHTML = items.map(function (x) {
+    return '<div class="bl-summary-item"><b>' + esc(x[1]) + '</b><span>' + esc(x[0]) + '</span></div>';
+  }).join('');
+  stats.classList.remove('hidden');
+
+  const emails = d.emails || [];
+  $('hunter-count').textContent = emails.length;
+  $('hunter-emails').textContent = emails.length ? emails.join('\n') : 'No emails found.';
+  $('hunter-emails-card').style.display = 'block';
+
+  $('hunter-status').textContent = 'Done — found ' + emails.length + ' unique email' +
+    (emails.length === 1 ? '' : 's') + ' in ' + (s.time_taken || 0) + 's.';
+}
+
+function finishHunterUi() {
+  const btn = $('hunter-btn');
+  btn.disabled = false;
+  btn.textContent = 'Start Crawl';
+  $('hunter-cancel').disabled = true;
+  hunterState.abort = null;
+}
+
+function cancelEmailHunter() {
+  if (hunterState.pollTimer) { clearInterval(hunterState.pollTimer); hunterState.pollTimer = null; }
+  if (hunterState.abort) hunterState.abort.abort();
+  finishHunterUi();
+  $('hunter-status').textContent = 'Cancelled.';
+  setTimeout(function () { $('hunter-progress').classList.add('hidden'); }, 500);
+}
+
+async function copyHunterEmails(btn) {
+  if (!hunterState.data || !hunterState.data.emails) { toast('Nothing to copy', 'err'); return; }
+  await copyValue(hunterState.data.emails.join('\n'), btn);
+}
+
+function exportHunterCsv() {
+  if (!hunterState.data || !hunterState.data.emails) { toast('Nothing to export', 'err'); return; }
+  const lines = ['Email'].concat(hunterState.data.emails);
+  const blob = new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'emails-despoil.csv';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  toast('CSV exported', 'ok');
+}
+
+/* ============================================================
+   Boot
+   ============================================================ */
+$('year').textContent = new Date().getFullYear();
+showPage('home');
+
+document.addEventListener('keydown', function (e) {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    const active = document.activeElement;
+    if (active && active.id === 'enc-input') encodeText();
+    if (active && active.id === 'dec-input') decodeText();
+    if (active && active.id === 'hunter-url') startEmailHunter();
+  }
+});
+</script>
+</body>
+</html>"""
 
 
 # ============================================================
@@ -45,19 +1503,52 @@ def _handle_any_error(e):
 # ============================================================
 @app.before_request
 def auth():
-    public = {"login", "favicon", "bimi", "home"}
+    public = {"login", "favicon", "favicon_ico", "bimi"}
     if request.endpoint in public:
         return
-    if request.path in ("/favicon.svg", "/bimi-logo.svg", "/favicon.ico"):
+    if request.path in ("/favicon.svg", "/favicon.ico", "/bimi-logo.svg"):
         return
+
     if not session.get("logged_in"):
         if request.path.startswith("/api/"):
             return jsonify(success=False, error="Login required"), 401
-        if request.path == "/":
-            return redirect(url_for("login", next="/"))
+        return redirect(url_for("login", next=request.path))
+
+    login_time = session.get("login_time", 0)
+    if time.time() - login_time > SESSION_MAX_AGE:
+        session.clear()
+        if request.path.startswith("/api/"):
+            return jsonify(success=False, error="Session expired"), 401
+        return redirect(url_for("login", next=request.path, expired="1"))
 
 
-LOGIN_HTML = '''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Login • UTF-8 Converter Lab</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#07111f;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}form{width:min(360px,90vw);padding:28px;border:1px solid #203651;border-radius:18px;background:#0d1b2e}input,button{width:100%;padding:12px;margin-top:9px;border-radius:9px;border:1px solid #29415e;box-sizing:border-box;font:inherit}input{background:#07111e;color:#fff;outline:none}input:focus{border-color:#42d9ff}button{background:#42d9ff;color:#06101b;font-weight:800;cursor:pointer;border:0}button:hover{background:#6ce4ff}.e{color:#ff8d9b;margin:6px 0 0;font-size:13px}h2{margin-top:0}p{margin:6px 0;color:#aeb9c5;font-size:14px}</style></head><body><form method="post"><h2>UTF-8 Converter Lab</h2><p>Sign in to continue.</p>{{ERR}}<input name="username" placeholder="Username" required autofocus autocomplete="username"><input name="password" type="password" placeholder="Password" required autocomplete="current-password"><input type="hidden" name="next" value="{{NEXT}}"><button type="submit">Login</button></form></body></html>'''
+LOGIN_HTML = '''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Sign in • Email journeys</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:#100b0a;color:#f6ede2;font-family:'Outfit',system-ui,-apple-system,'Segoe UI',Roboto,Arial,sans-serif;letter-spacing:-.01em;position:relative;overflow:hidden}
+body::before,body::after{content:'';position:fixed;border-radius:50%;filter:blur(120px);opacity:.4;pointer-events:none}
+body::before{width:520px;height:520px;background:radial-gradient(circle,#e05a3a,transparent 70%);top:-200px;left:-160px}
+body::after{width:480px;height:480px;background:radial-gradient(circle,#d94a7a,transparent 70%);bottom:-200px;right:-160px}
+form{position:relative;z-index:2;width:min(400px,90vw);padding:38px;border:1px solid rgba(255,255,255,.08);border-radius:24px;background:rgba(255,255,255,.04);backdrop-filter:blur(22px);box-shadow:0 34px 80px rgba(0,0,0,.6)}
+h2{margin:0 0 8px;font-size:24px;font-weight:700;letter-spacing:-.02em}
+p{margin:6px 0;color:#a89687;font-size:13.5px}
+input,button{width:100%;padding:14px;margin-top:11px;border-radius:13px;border:1px solid rgba(255,255,255,.09);box-sizing:border-box;font:inherit;font-size:14.5px;font-family:inherit;letter-spacing:-.01em}
+input{background:rgba(255,255,255,.05);color:#fff;outline:none;transition:.2s}
+input:focus{border-color:#e05a3a;box-shadow:0 0 0 4px rgba(224,90,58,.18)}
+button{background:linear-gradient(120deg,#e05a3a,#e89b3c);color:#fff;font-weight:700;cursor:pointer;border:0;margin-top:20px;transition:.2s;box-shadow:0 10px 26px rgba(224,90,58,.35)}
+button:hover{transform:translateY(-2px);box-shadow:0 16px 32px rgba(224,90,58,.45)}
+.e{color:#ff7a8a;margin:10px 0 0;font-size:13px;font-weight:500}
+.n{color:#ffb356;margin:10px 0 0;font-size:13px;font-weight:500}
+</style></head><body><form method="post">
+<h2>Email journeys</h2>
+<p>Sign in to continue.</p>{{ERR}}{{NOTICE}}
+<input name="username" placeholder="Username" required autofocus autocomplete="username">
+<input name="password" type="password" placeholder="Password" required autocomplete="current-password">
+<input type="hidden" name="next" value="{{NEXT}}">
+<button type="submit">Login</button>
+</form></body></html>'''
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -66,16 +1557,25 @@ def login():
         u = request.form.get("username", "").strip()
         p = request.form.get("password", "")
         if secrets.compare_digest(u, LOGIN_USERNAME) and check_password_hash(LOGIN_PASSWORD_HASH, p):
-            session.clear(); session["logged_in"] = True
-            nxt = request.form.get("next", "")
+            session.clear()
+            session.permanent = True
+            session["logged_in"] = True
+            session["login_time"] = time.time()
+            nxt = request.form.get("next", "") or ""
             return redirect(nxt if nxt.startswith("/") else "/")
         return login_page("Invalid username or password", request.form.get("next", "")), 401
-    return login_page("", request.args.get("next", ""))
+    expired = request.args.get("expired", "")
+    notice = "Your session expired. Please sign in again." if expired else ""
+    return login_page("", request.args.get("next", ""), notice)
 
 
-def login_page(error="", nxt="/"):
-    err_html = f'<p class="e">{error}</p>' if error else ""
-    html = LOGIN_HTML.replace("{{ERR}}", err_html).replace("{{NEXT}}", nxt or "/")
+def login_page(error="", nxt="/", notice=""):
+    err_html = '<p class="e">' + error + '</p>' if error else ""
+    notice_html = '<p class="n">' + notice + '</p>' if notice else ""
+    html = (LOGIN_HTML
+            .replace("{{ERR}}", err_html)
+            .replace("{{NOTICE}}", notice_html)
+            .replace("{{NEXT}}", nxt or "/"))
     return Response(html, mimetype="text/html")
 
 
@@ -87,108 +1587,153 @@ def logout():
 
 @app.route("/")
 def home():
-    return render_template("index.html")
+    if not session.get("logged_in"):
+        return redirect(url_for("login"))
+    login_time = session.get("login_time", 0)
+    if time.time() - login_time > SESSION_MAX_AGE:
+        session.clear()
+        return redirect(url_for("login", expired="1"))
+    return Response(INDEX_HTML, mimetype="text/html")
 
 
 # ============================================================
-# SVG assets (both /favicon.svg and /favicon.ico)
+# SVG assets
 # ============================================================
-LOGO_SVG = '''<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#07111f"/><path d="M32 5 55 18v28L32 59 9 46V18z" fill="#091827" stroke="#42d9ff" stroke-width="3"/><text x="32" y="39" text-anchor="middle" font-family="Arial,sans-serif" font-size="21" font-weight="700" fill="#42d9ff">{U}</text></svg>'''
-BIMI_SVG = '''<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.2" baseProfile="tiny-ps" viewBox="0 0 100 100"><title>UTF-8 Converter Lab</title><desc>UTF-8 Converter Lab brand logo</desc><rect width="100" height="100" fill="#07111f"/><path d="M50 9 88 31v38L50 91 12 69V31z" fill="#091827" stroke="#42d9ff" stroke-width="4"/><text x="50" y="59" text-anchor="middle" font-family="Arial,sans-serif" font-size="26" font-weight="700" fill="#42d9ff">{U}</text></svg>'''
+LOGO_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#100b0a"/><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#e05a3a"/><stop offset=".5" stop-color="#e89b3c"/><stop offset="1" stop-color="#d94a7a"/></linearGradient></defs><path d="M32 6 55 19v26L32 58 9 45V19z" fill="none" stroke="url(#g)" stroke-width="3.5" stroke-linejoin="round"/><text x="32" y="40" text-anchor="middle" font-family="Outfit,sans-serif" font-size="20" font-weight="700" fill="url(#g)">{U}</text></svg>'
+BIMI_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><title>Email journeys</title><rect width="100" height="100" fill="#100b0a"/><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#e05a3a"/><stop offset=".5" stop-color="#e89b3c"/><stop offset="1" stop-color="#d94a7a"/></linearGradient></defs><path d="M50 10 86 31v38L50 90 14 69V31z" fill="none" stroke="url(#g)" stroke-width="4" stroke-linejoin="round"/><text x="50" y="60" text-anchor="middle" font-family="Outfit,sans-serif" font-size="26" font-weight="700" fill="url(#g)">{U}</text></svg>'
+
 
 @app.route("/favicon.svg")
-def favicon(): return Response(LOGO_SVG, mimetype="image/svg+xml")
+def favicon():
+    return Response(LOGO_SVG, mimetype="image/svg+xml")
+
 
 @app.route("/favicon.ico")
-def favicon_ico(): return Response(LOGO_SVG, mimetype="image/svg+xml")
+def favicon_ico():
+    return Response(LOGO_SVG, mimetype="image/svg+xml")
+
 
 @app.route("/bimi-logo.svg")
-def bimi(): return Response(BIMI_SVG, mimetype="image/svg+xml")
+def bimi():
+    return Response(BIMI_SVG, mimetype="image/svg+xml")
 
 
 # ============================================================
 # Encode / Decode
 # ============================================================
 INVISIBLE = set("\u200b\u200c\u200d\u200e\u200f\u2060\u2061\u2062\u2063\u2064\u2065\u2066\u2067\u2068\u2069\u00ad\ufeff")
+
 def clean_decoded(s):
     s = s.replace("\u00a0", " ").replace("\u2007", " ")
     return "".join(c for c in s if c not in INVISIBLE)
-def q_byte(b): return "={:02X}".format(b)
+
+def q_byte(b):
+    return "={:02X}".format(b)
 
 def q1(text):
     parts = []
     for c in text:
-        if c == " ": parts.append("_")
-        else: parts.extend(q_byte(b) for b in c.encode("utf-8"))
+        if c == " ":
+            parts.append("_")
+        else:
+            parts.extend(q_byte(b) for b in c.encode("utf-8"))
     return "".join(parts)
 
 def q2(text):
     parts = []
     for c in text:
-        if c == " ": parts.append("_")
-        elif c in "=?:_": parts.append(q_byte(ord(c)))
-        elif c in string.ascii_letters: parts.append(q_byte(ord(c)) if random.random() < 0.50 else c)
-        elif c in string.digits: parts.append(q_byte(ord(c)) if random.random() < 0.35 else c)
-        elif ord(c) < 128 and 33 <= ord(c) <= 126: parts.append(q_byte(ord(c)))
-        else: parts.extend(q_byte(b) for b in c.encode("utf-8"))
+        if c == " ":
+            parts.append("_")
+        elif c in "=?:_":
+            parts.append(q_byte(ord(c)))
+        elif c in string.ascii_letters:
+            parts.append(q_byte(ord(c)) if random.random() < 0.50 else c)
+        elif c in string.digits:
+            parts.append(q_byte(ord(c)) if random.random() < 0.35 else c)
+        elif ord(c) < 128 and 33 <= ord(c) <= 126:
+            parts.append(q_byte(ord(c)))
+        else:
+            parts.extend(q_byte(b) for b in c.encode("utf-8"))
     return "".join(parts)
 
 def _split_random_chunks(text, count):
-    if count <= 1 or len(text) <= 1: return [text]
+    if count <= 1 or len(text) <= 1:
+        return [text]
     count = min(count, len(text))
     cuts = sorted(random.sample(range(1, len(text)), count - 1))
     points = [0] + cuts + [len(text)]
-    return [text[points[i]:points[i+1]] for i in range(count)]
+    return [text[points[i]:points[i + 1]] for i in range(count)]
 
 def _q3_utf8_word(text):
     payload = []
     for c in text:
-        if c == " ": payload.append("_")
-        else:
-            for b in c.encode("utf-8"):
-                if 33 <= b <= 126 and chr(b) not in "=?_": payload.append(chr(b))
-                else: payload.append(q_byte(b))
+        if c == " ":
+            payload.append("=20" if random.random() < 0.25 else "_")
+            continue
+        for b in c.encode("utf-8"):
+            ch = chr(b)
+            if 33 <= b <= 126 and ch not in "=?_":
+                if ch in string.ascii_letters:
+                    payload.append(q_byte(b) if random.random() < 0.25 else ch)
+                elif ch in string.digits:
+                    payload.append(q_byte(b) if random.random() < 0.25 else ch)
+                else:
+                    payload.append(q_byte(b) if random.random() < 0.25 else ch)
+            else:
+                payload.append(q_byte(b))
     return "=?UTF-8?Q?" + "".join(payload) + "?="
 
 def _b64_word(text):
-    return f"=?UTF-8?B?{base64.b64encode(text.encode('utf-8')).decode('ascii')}?="
+    return "=?UTF-8?B?" + base64.b64encode(text.encode("utf-8")).decode("ascii") + "?="
 
 def q3(text):
-    if not text: return ""
+    if not text:
+        return ""
     chunk_count = min(4, len(text)) if len(text) <= 24 else min(random.randint(4, 6), len(text))
     chunks = _split_random_chunks(text, chunk_count)
     return "".join(_q3_utf8_word(c) if i % 2 == 0 else _b64_word(c) for i, c in enumerate(chunks))
 
 def custom_b64(text):
     raw = base64.b64encode(text.encode("utf-8")).decode("ascii").rstrip("=")
-    if not raw: return "=?UTF-8?B??="
-    return f"=?UTF-8?B?{'_'.join(raw)}?="
+    if not raw:
+        return "=?UTF-8?B??="
+    return "=?UTF-8?B?" + "_".join(raw) + "?="
 
 def decode_q(value):
     value = value.strip().replace("\\", "")
     out = []
     for data, enc in decode_header(value):
-        if isinstance(data, bytes): out.append(data.decode(enc or "utf-8", errors="replace"))
-        else: out.append(data)
+        if isinstance(data, bytes):
+            out.append(data.decode(enc or "utf-8", errors="replace"))
+        else:
+            out.append(data)
     return clean_decoded("".join(out))
 
 def decode_b64(value):
     value = value.strip().replace("\\", "")
     if value.startswith("=?") and value.endswith("?="):
         parts = value[2:-2].split("?")
-        if len(parts) >= 3 and parts[1].upper() == "B": value = parts[2]
-    if "=__" in value or value.endswith("__"): value = value.replace("=__", "").replace("_", "")
+        if len(parts) >= 3 and parts[1].upper() == "B":
+            value = parts[2]
+    if "=__" in value or value.endswith("__"):
+        value = value.replace("=__", "").replace("_", "")
     value = value.replace(" ", "").replace("\n", "").replace("\r", "")
     value += "=" * ((4 - len(value) % 4) % 4)
-    try: return clean_decoded(base64.b64decode(value, validate=False).decode("utf-8", errors="replace"))
-    except Exception as e: raise ValueError("Invalid Base64 input") from e
+    try:
+        return clean_decoded(base64.b64decode(value, validate=False).decode("utf-8", errors="replace"))
+    except Exception as e:
+        raise ValueError("Invalid Base64 input") from e
 
 @app.post("/api/encode")
 def encode_api():
     t = (request.get_json(silent=True) or {}).get("text", "")
     response = jsonify(
-        q1=f"=?UTF-8?Q?{q1(t)}?=", q2=f"=?UTF-8?Q?{q2(t)}?=", q3=q3(t),
-        base64=f"=?UTF-8?B?{base64.b64encode(t.encode()).decode()}?=", base64_underscore=custom_b64(t))
+        q1="=?UTF-8?Q?" + q1(t) + "?=",
+        q2="=?UTF-8?Q?" + q2(t) + "?=",
+        q3=q3(t),
+        base64="=?UTF-8?B?" + base64.b64encode(t.encode()).decode() + "?=",
+        base64_underscore=custom_b64(t),
+    )
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     return response
@@ -196,13 +1741,17 @@ def encode_api():
 @app.post("/api/decode")
 def decode_api():
     value = (request.get_json(silent=True) or {}).get("text", "").strip()
-    if not value: return jsonify(error="Enter encoded text first"), 400
+    if not value:
+        return jsonify(error="Enter encoded text first"), 400
     try:
-        v = value.replace("\\", ""); upper = v.upper()
-        if "?Q?" in upper or upper.startswith("=?UTF-8?Q?") or upper.startswith("=?US-ASCII?Q?") or upper.startswith("=?ISO-8859-1?Q?"):
+        v = value.replace("\\", "")
+        upper = v.upper()
+        if ("?Q?" in upper or upper.startswith("=?UTF-8?Q?")
+                or upper.startswith("=?US-ASCII?Q?") or upper.startswith("=?ISO-8859-1?Q?")):
             return jsonify(output=decode_q(value), detected="UTF-8 Q")
         return jsonify(output=decode_b64(value), detected="Base64")
-    except Exception as e: return jsonify(error=str(e)), 400
+    except Exception as e:
+        return jsonify(error=str(e)), 400
 
 
 # ============================================================
@@ -214,9 +1763,12 @@ NAME_PREFIXES = ["nova","aeon","luma","vera","heli","ori","aqua","zeta","cyra","
 NAME_SUFFIXES = ["wave","flux","core","line","space","land","form","link","point","craft","field","scale","stone","vault","forge","path","node","port","gate","mark","flow","mesh","grid","byte"]
 
 def _generate_word(min_len, max_len):
-    n = random.randint(min_len, max_len); w = ""; con = random.choice([True, False])
+    n = random.randint(min_len, max_len)
+    w = ""
+    con = random.choice([True, False])
     while len(w) < n:
-        w += random.choice(CONSONANTS if con else VOWELS); con = not con
+        w += random.choice(CONSONANTS if con else VOWELS)
+        con = not con
     return w[:n]
 
 @app.post("/api/random/data")
@@ -229,12 +1781,18 @@ def random_data_api():
     min_len, max_len = sorted((min_len, max_len))
     if kind == "string":
         chars = string.ascii_letters + string.digits
-        return jsonify(results=["".join(secrets.choice(chars) for _ in range(random.randint(min_len, max_len))) for _ in range(count)])
+        return jsonify(results=[
+            "".join(secrets.choice(chars) for _ in range(random.randint(min_len, max_len)))
+            for _ in range(count)
+        ])
     if kind == "words":
         results, used, attempts = [], set(), 0
         while len(results) < count and attempts < count * 30:
-            attempts += 1; w = _generate_word(min_len, max_len).capitalize()
-            if w not in used: used.add(w); results.append(w)
+            attempts += 1
+            w = _generate_word(min_len, max_len).capitalize()
+            if w not in used:
+                used.add(w)
+                results.append(w)
         return jsonify(results=results)
     return jsonify(error="Unknown generator"), 400
 
@@ -247,522 +1805,29 @@ def names_api():
         parts = []
         for _ in range(random.choice([2, 3])):
             style = random.choice(["pref", "suff", "word"])
-            if style == "pref": parts.append(random.choice(NAME_PREFIXES))
-            elif style == "suff": parts.append(random.choice(NAME_SUFFIXES))
-            else: parts.append(_generate_word(4, 8).lower())
+            if style == "pref":
+                parts.append(random.choice(NAME_PREFIXES))
+            elif style == "suff":
+                parts.append(random.choice(NAME_SUFFIXES))
+            else:
+                parts.append(_generate_word(4, 8).lower())
         results.append(random.choice(["-", ".", "_"]).join(parts))
     return jsonify(results=results)
 
 
-
 # ============================================================
-# Email Hunter — direct public-site spider
+# Blocklist
 # ============================================================
-# This crawler deliberately does NOT inherit HTTP_PROXY / HTTPS_PROXY.
-# It uses urllib with ProxyHandler({}) first, then requests with trust_env=False
-# as a fallback. The site limit is fixed at 120 seconds.
-EH_EMAIL_REGEX = re.compile(
-    r'(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}(?![A-Za-z0-9._%+-])'
-)
-EH_URL_REGEX = re.compile(r'https?://[^\s"\'<>]+', re.I)
-EH_REL_URL_REGEX = re.compile(r'(?<![A-Za-z0-9_])(?:/[A-Za-z0-9][^\s"\'<>]{0,500})')
-EH_CONTACT_KEYWORDS = re.compile(
-    r'contact|kontakt|impressum|imprint|privacy|datenschutz|about|team|staff|person|people|'
-    r'directory|department|abteilung|hauptabteilung|press|media|presse|newsletter|office|'
-    r'ansprechpartner|service|help|support|career|jobs|verwaltung|generalvikariat|bistum|'
-    r'pfarrei|pfarreien|glaube|bildung|finanzen|sitemap|site-map', re.I)
-EH_OBFUSCATION_PATTERNS = [
-    r'([A-Za-z0-9._%+-]+)\s*\[at\]\s*([A-Za-z0-9.-]+)\s*\[dot\]\s*([A-Za-z]{2,63})',
-    r'([A-Za-z0-9._%+-]+)\s*\(at\)\s*([A-Za-z0-9.-]+)\s*\(dot\)\s*([A-Za-z]{2,63})',
-    r'([A-Za-z0-9._%+-]+)\s+AT\s+([A-Za-z0-9.-]+)\s+DOT\s+([A-Za-z]{2,63})',
-    r'([A-Za-z0-9._%+-]+)\s*\{at\}\s*([A-Za-z0-9.-]+)\s*\{dot\}\s*([A-Za-z]{2,63})',
-    r'([A-Za-z0-9._%+-]+)\s*#AT#\s*([A-Za-z0-9.-]+)\s*#DOT#\s*([A-Za-z]{2,63})',
-]
-# Do not skip PDF here: public PDFs often contain contact emails.
-EH_SKIP_EXTENSIONS = (
-    '.jpg','.jpeg','.png','.gif','.bmp','.svg','.webp','.ico','.avif','.heic','.heif',
-    '.css','.map','.js','.json','.xml','.rss','.atom','.zip','.rar','.7z','.tar','.gz','.bz2','.xz',
-    '.mp3','.wav','.ogg','.mp4','.avi','.mov','.mkv','.webm','.woff','.woff2','.ttf','.otf','.eot'
-)
-EH_TRACKING_PARAMS = {'utm_source','utm_medium','utm_campaign','utm_term','utm_content','utm_id','gclid','fbclid','msclkid'}
-EH_JOBS = {}
-EH_JOBS_LOCK = threading.Lock()
-
-
-def eh_normalize_url(url):
-    try:
-        url = urldefrag(str(url).strip())[0]
-        if not url:
-            return None
-        parsed = urlparse(url)
-        if parsed.scheme not in ('http', 'https') or not parsed.netloc:
-            return None
-        from urllib.parse import parse_qsl, urlencode
-        pairs = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
-                 if k.lower() not in EH_TRACKING_PARAMS]
-        path = parsed.path or '/'
-        if path != '/' and path.endswith('/'):
-            path = path.rstrip('/')
-        return parsed._replace(path=path, query=urlencode(pairs, doseq=True), fragment='').geturl()
-    except Exception:
-        return None
-
-
-def eh_host_key(host):
-    host = (host or '').lower().split(':', 1)[0].rstrip('.')
-    return host[4:] if host.startswith('www.') else host
-
-
-def eh_same_site(url, root_host, include_subdomains=True):
-    host = eh_host_key(urlparse(url).netloc)
-    root = eh_host_key(root_host)
-    return host == root or (include_subdomains and host.endswith('.' + root))
-
-
-def eh_valid_email(email):
-    email = html_lib_unescape(str(email)).strip().strip('.,;:()[]{}<>"\'')
-    return bool(email) and len(email) <= 254 and bool(EH_EMAIL_REGEX.fullmatch(email))
-
-
-def eh_extract_emails(content):
-    """Extract emails from HTML/source/text/bytes. Handles mailto and common obfuscations."""
-    if content is None:
-        return set()
-    if isinstance(content, bytes):
-        text = content.decode('utf-8', errors='ignore')
-        # Some PDFs/documents expose email text only in their raw byte stream.
-        if not text.strip():
-            text = content.decode('latin-1', errors='ignore')
-    else:
-        text = str(content)
-    decoded = html_lib_unescape(text)
-    found = set()
-
-    def scan(value):
-        if not value:
-            return
-        value = html_lib_unescape(str(value))
-        for m in EH_EMAIL_REGEX.findall(value):
-            if eh_valid_email(m):
-                found.add(m.lower())
-        for pattern in EH_OBFUSCATION_PATTERNS:
-            for m in re.finditer(pattern, value, re.I):
-                candidate = f'{m.group(1).strip()}@{m.group(2).strip()}.{m.group(3).strip()}'
-                if eh_valid_email(candidate):
-                    found.add(candidate.lower())
-        # info at example dot de / info (at) example (dot) de
-        for m in re.finditer(
-            r'([A-Za-z0-9._%+-]+)\s*(?:\[at\]|\(at\)|\bat\b)\s*'
-            r'([A-Za-z0-9.-]+)\s*(?:\[dot\]|\(dot\)|\bdot\b)\s*([A-Za-z]{2,63})',
-            value, re.I):
-            candidate = f'{m.group(1)}@{m.group(2)}.{m.group(3)}'
-            if eh_valid_email(candidate):
-                found.add(candidate.lower())
-
-    # Raw source catches script-generated email strings and mailto links.
-    scan(decoded)
-    if '<' in decoded and '>' in decoded:
-        try:
-            soup = BeautifulSoup(decoded, 'html.parser')
-            scan(soup.get_text(' ', strip=True))
-            for tag in soup.find_all(True):
-                for attr in ('href','src','content','title','alt','aria-label','onclick',
-                             'onmouseover','data-email','data-mail','data-email-address',
-                             'data-contact','data-contact-email','data-value','data-url'):
-                    value = tag.get(attr)
-                    if value:
-                        scan(value)
-        except Exception:
-            pass
-    return found
-
-
-def eh_is_contact_page(html, url=''):
-    try:
-        soup = BeautifulSoup(html or '', 'html.parser')
-        title = soup.title.get_text(' ', strip=True) if soup.title else ''
-        return bool(EH_CONTACT_KEYWORDS.search(f'{title} {url}'))
-    except Exception:
-        return bool(EH_CONTACT_KEYWORDS.search(url or ''))
-
-
-def eh_should_skip(url):
-    p = urlparse(url)
-    return p.scheme not in ('http','https') or not p.netloc or p.path.lower().endswith(EH_SKIP_EXTENSIONS)
-
-
-def eh_discover_links(html, current_url, root_host, include_subdomains=True):
-    """Find href plus title/data/onclick/source URLs. Title text itself is not treated as a URL unless it contains one."""
-    links = set()
-    if not html:
-        return links
-    raw = html.decode('utf-8', errors='ignore') if isinstance(html, bytes) else str(html)
-    decoded = html_lib_unescape(raw)
-
-    def add(value):
-        if not isinstance(value, str):
-            return
-        value = html_lib_unescape(value).strip().strip('\\\'"')
-        if not value or value.lower().startswith(('javascript:','mailto:','tel:','sms:','data:')):
-            return
-        candidates = [value]
-        candidates += re.findall(r'https?://[^\s"\'<>]+', value, re.I)
-        candidates += re.findall(r'(?<![A-Za-z0-9_])/[A-Za-z0-9][^\s"\'<>)]{0,500}', value)
-        for candidate in candidates:
-            candidate = candidate.rstrip('.,;)]}')
-            absolute = eh_normalize_url(urljoin(current_url, candidate))
-            if absolute and not eh_should_skip(absolute) and eh_same_site(absolute, root_host, include_subdomains):
-                links.add(absolute)
-
-    try:
-        soup = BeautifulSoup(decoded, 'html.parser')
-        attrs = ('href','title','data-href','data-url','data-link','data-target','data-path','data-route',
-                 'data-page','data-page-url','data-nav','data-menu-url','data-menu','data-item-url',
-                 'data-target-url','data-route-url','data-endpoint','data-permalink','data-canonical',
-                 'ng-href','routerlink','router-link','to','onclick','onmousedown')
-        for tag in soup.find_all(True):
-            for attr in attrs:
-                value = tag.get(attr)
-                if value:
-                    add(value)
-            if tag.name == 'meta' and str(tag.get('http-equiv','')).lower() == 'refresh':
-                m = re.search(r'url\s*=\s*(.+)$', str(tag.get('content','')), re.I)
-                if m:
-                    add(m.group(1))
-    except Exception:
-        pass
-
-    # Source-level URLs catch links generated by scripts/templates.
-    for value in EH_URL_REGEX.findall(decoded):
-        add(value)
-    for value in EH_REL_URL_REGEX.findall(decoded):
-        if not any(x in value.lower() for x in ('/wp-content/','/static/','/assets/','/fonts/')):
-            add(value)
-    return links
-
-
-def eh_direct_fetch(url, timeout=5):
-    """Fetch directly, ignoring OS/Python proxy environment variables."""
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,text/plain,application/pdf,application/json,*/*;q=0.8',
-        'Accept-Language': 'de-DE,de;q=0.9,en;q=0.7',
-        'Accept-Encoding': 'gzip',
-        'Connection': 'close',
-    }
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    req = urllib.request.Request(url, headers=headers, method='GET')
-    try:
-        with opener.open(req, timeout=timeout) as response:
-            data = response.read()
-            if response.headers.get('Content-Encoding','').lower() == 'gzip':
-                try:
-                    data = gzip.decompress(data)
-                except Exception:
-                    pass
-            return response.geturl(), int(response.status), dict(response.headers.items()), data, None
-    except urllib.error.HTTPError as e:
-        try:
-            data = e.read()
-        except Exception:
-            data = b''
-        return url, int(e.code), dict(e.headers.items()) if e.headers else {}, data, f'HTTP {e.code}: {e.reason}'
-    except Exception as exc:
-        return url, 0, {}, b'', f'{type(exc).__name__}: {exc}'
-
-
-def eh_fallback_requests_fetch(url, timeout=5):
-    """Second direct path; requests does not inherit proxy variables."""
-    try:
-        s = requests.Session()
-        s.trust_env = False
-        s.proxies = {}
-        s.headers.update({'User-Agent':'Mozilla/5.0 Chrome/154 Safari/537.36'})
-        r = s.get(url, timeout=timeout, allow_redirects=True)
-        return r.url, r.status_code, dict(r.headers), r.content, None if r.ok else f'HTTP {r.status_code}'
-    except Exception as exc:
-        return url, 0, {}, b'', f'{type(exc).__name__}: {exc}'
-
-
-def eh_sitemap_urls(base_url, root_host, include_subdomains=True, timeout=4, max_urls=50000):
-    parsed = urlparse(base_url)
-    origin = f'{parsed.scheme}://{parsed.netloc}'
-    candidates = [origin+'/sitemap.xml', origin+'/sitemap_index.xml', origin+'/sitemap/sitemap.xml']
-    rr = eh_direct_fetch(origin+'/robots.txt', timeout)
-    if rr[1] == 200:
-        text = rr[3].decode('utf-8','ignore')
-        candidates += [line.split(':',1)[1].strip() for line in text.splitlines() if line.lower().startswith('sitemap:')]
-    queue, seen, found = [], set(), set()
-    for x in candidates:
-        u = eh_normalize_url(x)
-        if u and u not in seen:
-            seen.add(u); queue.append(u)
-    while queue and len(found) < max_urls:
-        sm = queue.pop(0)
-        final, status, headers, body, err = eh_direct_fetch(sm, timeout)
-        if status != 200 or not body or len(body) > 50*1024*1024:
-            continue
-        text = body.decode('utf-8','ignore')
-        for raw in re.findall(r'<loc>\s*(.*?)\s*</loc>', text, re.I|re.S):
-            u = eh_normalize_url(raw.strip())
-            if not u or not eh_same_site(u, root_host, include_subdomains):
-                continue
-            if u.lower().endswith(('.xml','.xml.gz')):
-                if u not in seen:
-                    seen.add(u); queue.append(u)
-            elif not eh_should_skip(u):
-                found.add(u)
-    return found
-
-
-def eh_special_seed_urls(base_url, root_host, include_subdomains=True):
-    parsed = urlparse(base_url); origin = f'{parsed.scheme}://{parsed.netloc}'
-    paths = ['/Sitemap','/sitemap','/site-map','/Impressum','/impressum','/Datenschutz','/datenschutz',
-             '/Kontakt','/kontakt','/Contact','/contact','/About','/about','/Team','/team','/directory','/service']
-    return {u for u in (eh_normalize_url(origin+x) for x in paths)
-            if u and eh_same_site(u, root_host, include_subdomains)}
-
-
-def eh_browser_available():
-    try:
-        import playwright.sync_api
-        return True
-    except Exception:
-        return False
-
-
-def eh_browser_fetch(browser, url, root_host, include_subdomains):
-    page = None
-    try:
-        page = browser.new_page()
-        page.set_default_navigation_timeout(7000)
-        page.goto(url, wait_until='domcontentloaded', timeout=7000)
-        try: page.wait_for_timeout(300)
-        except Exception: pass
-        final_url = eh_normalize_url(page.url) or url
-        if not eh_same_site(final_url, root_host, include_subdomains):
-            return final_url, '', set(), 'Redirected outside allowed site'
-        html = page.content()
-        return final_url, html, eh_discover_links(html, final_url, root_host, include_subdomains), None
-    except Exception as exc:
-        return url, '', set(), f'{type(exc).__name__}: {exc}'
-    finally:
-        try:
-            if page: page.close()
-        except Exception: pass
-
-
-def eh_crawl_site(base_url, progress=None, include_subdomains=True, use_sitemap=True, render_js=True, **_ignored):
-    """Crawl one public site for at most 120 seconds. No proxy, no login/CAPTCHA bypass."""
-    base_url = eh_normalize_url(base_url)
-    if not base_url:
-        raise ValueError('Invalid HTTP/HTTPS URL')
-    root_host = urlparse(base_url).netloc
-    started = time.time()
-    HARD_LIMIT, REQUEST_TIMEOUT = 120.0, 5.0
-    MAX_PAGES, MAX_EMAILS, WORKERS = 50000, 50000, 24
-
-    visited, queued = set(), set()
-    frontier, results, email_sources = [], [], {}
-    pages = contact_pages = errors = discovered = 0
-    last_error = ''
-
-    def add_url(url, depth=0):
-        nonlocal discovered
-        u = eh_normalize_url(url)
-        if not u or u in visited or u in queued or eh_should_skip(u) or not eh_same_site(u, root_host, include_subdomains):
-            return
-        queued.add(u); frontier.append((u, depth)); discovered += 1
-
-    add_url(base_url, 0)
-    for u in eh_special_seed_urls(base_url, root_host, include_subdomains):
-        add_url(u, 0)
-    if use_sitemap and time.time()-started < 10:
-        for u in eh_sitemap_urls(base_url, root_host, include_subdomains, timeout=3, max_urls=50000):
-            add_url(u, 0)
-            if time.time()-started >= 10: break
-
-    browser = None
-    browser_used = False
-    if render_js and eh_browser_available() and time.time()-started < HARD_LIMIT-5:
-        try:
-            from playwright.sync_api import sync_playwright
-            pw = sync_playwright().start()
-            browser = pw.chromium.launch(headless=True, args=['--no-proxy-server','--disable-features=UseChromeOSDirectVideoDecoder'])
-            browser_used = True
-        except Exception as exc:
-            last_error = f'Playwright unavailable: {type(exc).__name__}: {exc}'
-            try: pw.stop()
-            except Exception: pass
-
-    def fetch(item):
-        url, depth = item
-        final, status, headers, body, err = eh_direct_fetch(url, REQUEST_TIMEOUT)
-        # If urllib fails, try requests without environment proxies.
-        if not body and status == 0 and time.time()-started < HARD_LIMIT:
-            final2, status2, headers2, body2, err2 = eh_fallback_requests_fetch(url, REQUEST_TIMEOUT)
-            if body2 or status2:
-                final, status, headers, body, err = final2, status2, headers2, body2, err2
-        return url, depth, final, status, headers, body, err
-
-    pool = ThreadPoolExecutor(max_workers=WORKERS)
-    try:
-        while frontier and len(visited) < MAX_PAGES and len(email_sources) < MAX_EMAILS and time.time()-started < HARD_LIMIT:
-            frontier.sort(key=lambda x: (0 if x[1] == 0 else 1, 0 if EH_CONTACT_KEYWORDS.search(x[0]) else 1, x[1]))
-            batch=[]
-            while frontier and len(batch) < WORKERS:
-                item=frontier.pop(0); queued.discard(item[0])
-                if item[0] not in visited:
-                    visited.add(item[0]); batch.append(item)
-            if not batch: continue
-            futures=[pool.submit(fetch,item) for item in batch]
-            for fut in as_completed(futures):
-                if time.time()-started >= HARD_LIMIT: break
-                url, depth, final, status, headers, body, err = fut.result()
-                html = body.decode(headers.get('Content-Type','').split('charset=')[-1].split(';')[0].strip() or 'utf-8', errors='ignore') if body else ''
-                content_type=(headers.get('Content-Type','') or '').lower()
-
-                # Render JS only when normal fetch returned little/no useful HTML.
-                if browser and (not body or (len(body) < 15000 and b'<script' in body.lower())) and time.time()-started < HARD_LIMIT-3:
-                    bfinal,bhtml,blinks,berr=eh_browser_fetch(browser,url,root_host,include_subdomains)
-                    if bhtml:
-                        final,html,content_type=bfinal,bhtml,'text/html'
-                        body=bhtml.encode('utf-8','ignore')
-                        err=None
-                    elif berr and not err:
-                        err=berr
-
-                if err and not body:
-                    errors += 1; last_error=f'{url} -> {err}'
-                if not body:
-                    if progress: progress({'pages':pages,'queued':len(frontier),'emails':len(email_sources),'contact_pages':contact_pages,'errors':errors,'discovered':discovered,'visited':len(visited),'current_url':url,'last_error':last_error})
-                    continue
-
-                pages += 1
-                is_contact=eh_is_contact_page(html,final)
-                if is_contact: contact_pages += 1
-                for email in sorted(eh_extract_emails(body)):
-                    if email not in email_sources:
-                        email_sources[email]=final
-                        results.append({'email':email,'website':base_url,'source_page':final,'contact_page':is_contact})
-                        if len(email_sources)>=MAX_EMAILS: break
-
-                if content_type.startswith('text/html') or '<html' in html[:2000].lower():
-                    links=eh_discover_links(html,final,root_host,include_subdomains)
-                    for link in links:
-                        add_url(link,depth+1)
-
-                if progress: progress({'pages':pages,'queued':len(frontier),'emails':len(email_sources),'contact_pages':contact_pages,'errors':errors,'discovered':discovered,'visited':len(visited),'current_url':final,'last_error':last_error})
-    finally:
-        try: pool.shutdown(wait=False,cancel_futures=True)
-        except TypeError: pool.shutdown(wait=False)
-        try:
-            if browser: browser.close()
-        except Exception: pass
-        try:
-            if 'pw' in locals(): pw.stop()
-        except Exception: pass
-
-    return {'results':results,'pages':pages,'contact_pages':contact_pages,'errors':errors,'queued':len(frontier),
-            'discovered':discovered,'visited':len(visited),'last_error':last_error,'elapsed':round(time.time()-started,2),
-            'browser_used':browser_used,'time_limit_seconds':HARD_LIMIT}
-
-
-def eh_job_update(job_id, **values):
-    with EH_JOBS_LOCK:
-        if job_id in EH_JOBS: EH_JOBS[job_id].update(values)
-
-
-def eh_run_job(job_id, urls, config):
-    started=time.time(); combined=[]
-    totals={'websites':len(urls),'emails':0,'pages':0,'contact_pages':0,'errors':0,'discovered':0,'visited':0}
-    warnings=[]
-    try:
-        for site_index,url in enumerate(urls,1):
-            eh_job_update(job_id,status='running',current_site=url,site_index=site_index)
-            def progress(info):
-                eh_job_update(job_id,progress=info,totals={**totals,'emails':len({r['email'] for r in combined})+info.get('emails',0)})
-            result=eh_crawl_site(url,progress=progress,**config)
-            combined.extend(result['results'])
-            for k in ('pages','contact_pages','errors','discovered','visited'): totals[k]+=result.get(k,0)
-            totals['emails']=len({r['email'] for r in combined})
-            if result.get('last_error'): warnings.append(result['last_error'])
-            eh_job_update(job_id,totals=totals.copy(),site_done=site_index)
-        unique={}
-        for row in combined: unique[(row['email'],row['source_page'])]=row
-        results=sorted(unique.values(),key=lambda r:(r['email'],r['website'],r['source_page']))
-        totals['emails']=len({r['email'] for r in results})
-        warning='Public HTTP/HTTPS pages only; no login/CAPTCHA/access-control bypass. '
-        if warnings: warning += 'Last crawler note: ' + warnings[-1]
-        eh_job_update(job_id,status='done',results=results,totals=totals,elapsed=round(time.time()-started,2),current_site='',warning=warning)
-    except Exception as exc:
-        eh_job_update(job_id,status='error',error=f'{type(exc).__name__}: {exc}',elapsed=round(time.time()-started,2))
-
-
-def _eh_parse_config(data):
-    return {'include_subdomains':bool(data.get('include_subdomains',True)), 'use_sitemap':bool(data.get('use_sitemap',True)), 'render_js':True}
-
-
-@app.post('/api/email-hunter/start')
-def email_hunter_start_api():
-    data=request.get_json(silent=True) or {}; raw_urls=data.get('urls') or []
-    if isinstance(raw_urls,str): raw_urls=re.split(r'[\r\n,]+',raw_urls)
-    urls=[]
-    for raw in raw_urls:
-        u=eh_normalize_url(str(raw))
-        if u and u not in urls: urls.append(u)
-    if not urls: return jsonify(error='Enter at least one valid HTTP/HTTPS URL.'),400
-    if len(urls)>10: return jsonify(error='Maximum 10 starting websites per crawl request.'),400
-    job_id=secrets.token_urlsafe(12)
-    job={'status':'queued','results':[],'totals':{'websites':len(urls),'emails':0,'pages':0,'contact_pages':0,'errors':0,'discovered':0,'visited':0},
-         'progress':{'pages':0,'queued':0,'emails':0,'contact_pages':0,'errors':0,'discovered':0,'visited':0,'current_url':'','last_error':''},
-         'current_site':urls[0],'site_index':0,'site_done':0,'urls':urls,'created':time.time()}
-    with EH_JOBS_LOCK: EH_JOBS[job_id]=job
-    threading.Thread(target=eh_run_job,args=(job_id,urls,{'include_subdomains':True,'use_sitemap':True,'render_js':True}),daemon=True).start()
-    return jsonify(job_id=job_id,status='queued')
-
-
-@app.get('/api/email-hunter/status/<job_id>')
-def email_hunter_status_api(job_id):
-    with EH_JOBS_LOCK:
-        job=EH_JOBS.get(job_id)
-        if not job: return jsonify(error='Crawl job not found or expired.'),404
-        return jsonify(job)
-
-
-@app.post('/api/email-hunter/crawl')
-def email_hunter_crawl_api():
-    data=request.get_json(silent=True) or {}; raw_urls=data.get('urls') or []
-    if isinstance(raw_urls,str): raw_urls=re.split(r'[\r\n,]+',raw_urls)
-    urls=[]
-    for raw in raw_urls:
-        u=eh_normalize_url(str(raw))
-        if u and u not in urls: urls.append(u)
-    if not urls: return jsonify(error='Enter at least one valid HTTP/HTTPS URL.'),400
-    if len(urls)>10: return jsonify(error='Maximum 10 starting websites per crawl request.'),400
-    started=time.time(); combined=[]; totals={'pages':0,'contact_pages':0,'errors':0,'discovered':0,'visited':0}; notes=[]
-    for url in urls:
-        r=eh_crawl_site(url,include_subdomains=True,use_sitemap=True,render_js=True); combined.extend(r['results'])
-        for k in totals: totals[k]+=r.get(k,0)
-        if r.get('last_error'): notes.append(r['last_error'])
-    unique={(r['email'],r['source_page']):r for r in combined}
-    results=sorted(unique.values(),key=lambda r:(r['email'],r['website'],r['source_page']))
-    return jsonify(results=results,totals={'websites':len(urls),'emails':len({r['email'] for r in results}),**totals},elapsed=round(time.time()-started,2),
-                   warning='Public HTTP/HTTPS pages only; no login/CAPTCHA/access-control bypass.'+((' Last crawler note: '+notes[-1]) if notes else ''))
-
-# ============================================================
-# Blocklist — Spamhaus zen (CSS / PBL / SBL) + Barracuda + DBL
-# ============================================================
-MAX_BLOCKLIST_IPS = int(os.environ.get("MAX_BLOCKLIST_IPS", "4096"))
-BLOCKLIST_WORKERS = int(os.environ.get("BLOCKLIST_WORKERS", "32"))
+MAX_BLOCKLIST_IPS = int(os.environ.get("MAX_BLOCKLIST_IPS", "1024"))
+BLOCKLIST_WORKERS = int(os.environ.get("BLOCKLIST_WORKERS", "24"))
 DNS_TIMEOUT = float(os.environ.get("DNS_TIMEOUT", "3.0"))
 DNS_LIFETIME = float(os.environ.get("DNS_LIFETIME", "5.0"))
 
 DQS_KEY = os.environ.get("SPAMHAUS_DQS_KEY", "").strip()
 
 if DQS_KEY:
-    ZEN_ZONE = f"{DQS_KEY}.zen.dq.spamhaus.net"
-    DBL_ZONE = f"{DQS_KEY}.dbl.dq.spamhaus.net"
+    ZEN_ZONE = DQS_KEY + ".zen.dq.spamhaus.net"
+    DBL_ZONE = DQS_KEY + ".dbl.dq.spamhaus.net"
 else:
     ZEN_ZONE = "zen.spamhaus.org"
     DBL_ZONE = "dbl.spamhaus.org"
@@ -811,8 +1876,10 @@ def _build_resolver():
             r = dns.resolver.Resolver()
         r.timeout = DNS_TIMEOUT
         r.lifetime = DNS_LIFETIME
-        try: r.retry_servfail = False
-        except Exception: pass
+        try:
+            r.retry_servfail = False
+        except Exception:
+            pass
         return r
     except Exception:
         return None
@@ -826,9 +1893,7 @@ RESOLVER_NAMESERVERS = list(getattr(_DNS_RESOLVER, "nameservers", []) or []) if 
 def _dns_lookup_a(query):
     if USE_DNSPYTHON:
         try:
-            answers = _DNS_RESOLVER.resolve(query, "A",
-                                            raise_on_no_answer=False,
-                                            lifetime=DNS_LIFETIME)
+            answers = _DNS_RESOLVER.resolve(query, "A", raise_on_no_answer=False, lifetime=DNS_LIFETIME)
             rrset = getattr(answers, "rrset", None)
             if not rrset:
                 return []
@@ -858,18 +1923,20 @@ def _reverse_dns(ip):
     def _worker():
         try:
             h, _, _ = socket.gethostbyaddr(ip)
-            if h: box["host"] = h.rstrip(".")
+            if h:
+                box["host"] = h.rstrip(".")
         except Exception:
             pass
     t = threading.Thread(target=_worker, daemon=True)
-    t.start(); t.join(DNS_LIFETIME)
+    t.start()
+    t.join(DNS_LIFETIME)
     return box["host"]
 
 
 def spamhaus_zen(ip):
     out = {"css": "N/A", "pbl": "N/A", "sbl": "N/A", "codes": [], "error_reason": None}
     rev = ".".join(reversed(ip.split(".")))
-    answers = _dns_lookup_a(f"{rev}.{ZEN_ZONE}")
+    answers = _dns_lookup_a(rev + "." + ZEN_ZONE)
     if not answers:
         return out
     for a in answers:
@@ -880,49 +1947,67 @@ def spamhaus_zen(ip):
         label = ZEN_CODES.get(a)
         if not label:
             continue
-        if "SBL" in label: out["sbl"] = "LISTED"
-        if "CSS" in label: out["css"] = "LISTED"
-        if "PBL" in label: out["pbl"] = "LISTED"
-        if "XBL" in label or "DROP" in label: out["sbl"] = "LISTED"
+        if "SBL" in label:
+            out["sbl"] = "LISTED"
+        if "CSS" in label:
+            out["css"] = "LISTED"
+        if "PBL" in label:
+            out["pbl"] = "LISTED"
+        if "XBL" in label or "DROP" in label:
+            out["sbl"] = "LISTED"
     if out["error_reason"] and not any(v == "LISTED" for v in (out["css"], out["pbl"], out["sbl"])):
-        out["css"] = "ERROR"; out["pbl"] = "ERROR"; out["sbl"] = "ERROR"
+        out["css"] = "ERROR"
+        out["pbl"] = "ERROR"
+        out["sbl"] = "ERROR"
     return out
 
 
 def barracuda_status(ip):
     rev = ".".join(reversed(ip.split(".")))
-    answers = set(_dns_lookup_a(f"{rev}.{BARRACUDA_ZONE}"))
-    if not answers: return "N/A"
-    if answers & set(SPAMHAUS_ERROR_CODES): return "ERROR"
-    if answers & BARRACUDA_LISTED: return "LISTED"
+    answers = set(_dns_lookup_a(rev + "." + BARRACUDA_ZONE))
+    if not answers:
+        return "N/A"
+    if answers & set(SPAMHAUS_ERROR_CODES):
+        return "ERROR"
+    if answers & BARRACUDA_LISTED:
+        return "LISTED"
     for a in answers:
-        if a.startswith("127."): return "LISTED"
+        if a.startswith("127."):
+            return "LISTED"
     return "N/A"
 
 
 def registered_domain(hostname):
-    if not hostname or hostname == "-": return None
+    if not hostname or hostname == "-":
+        return None
     try:
         labels = [x for x in hostname.strip().lower().rstrip(".").split(".") if x]
-        if len(labels) < 2: return None
+        if len(labels) < 2:
+            return None
         multi = {"co.uk","org.uk","ac.uk","gov.uk","com.au","net.au","org.au",
                  "com.br","com.cn","com.hk","co.jp","co.in","co.nz","co.za",
                  "com.sg","com.mx","com.tr","com.tw"}
         suffix = ".".join(labels[-2:])
-        if len(labels) >= 3 and suffix in multi: return ".".join(labels[-3:])
+        if len(labels) >= 3 and suffix in multi:
+            return ".".join(labels[-3:])
         return suffix
     except Exception:
         return None
 
 
 def dbl_status(domain):
-    if not domain: return "N/A"
-    answers = set(_dns_lookup_a(f"{domain}.{DBL_ZONE}"))
-    if not answers: return "N/A"
-    if answers & set(SPAMHAUS_ERROR_CODES): return "ERROR"
-    if answers & DBL_LISTED: return "LISTED"
+    if not domain:
+        return "N/A"
+    answers = set(_dns_lookup_a(domain + "." + DBL_ZONE))
+    if not answers:
+        return "N/A"
+    if answers & set(SPAMHAUS_ERROR_CODES):
+        return "ERROR"
+    if answers & DBL_LISTED:
+        return "LISTED"
     for a in answers:
-        if a.startswith("127."): return "LISTED"
+        if a.startswith("127."):
+            return "LISTED"
     return "N/A"
 
 
@@ -959,7 +2044,7 @@ def blocklist_ip_range(first_ip, last_ip):
         raise ValueError("Last IP address must be greater than or equal to First IP address.")
     count = int(last) - int(first) + 1
     if count > MAX_BLOCKLIST_IPS:
-        raise ValueError(f"Maximum {MAX_BLOCKLIST_IPS} IP addresses are allowed per check.")
+        raise ValueError("Maximum " + str(MAX_BLOCKLIST_IPS) + " IP addresses are allowed per check.")
     return [str(ipaddress.IPv4Address(n)) for n in range(int(first), int(last) + 1)]
 
 
@@ -1015,9 +2100,10 @@ def blocklist_check_api():
             try:
                 results.append(future.result())
             except Exception:
-                results.append({"ip": ip, "css": "N/A", "pbl": "N/A", "sbl": "N/A",
-                                "barracuda": "N/A", "rdns": "-",
-                                "dbl_domain": "-", "dbl": "N/A"})
+                results.append({
+                    "ip": ip, "css": "N/A", "pbl": "N/A", "sbl": "N/A",
+                    "barracuda": "N/A", "rdns": "-", "dbl_domain": "-", "dbl": "N/A"
+                })
 
     results.sort(key=lambda r: int(ipaddress.IPv4Address(r["ip"])))
     totals = {
@@ -1044,16 +2130,56 @@ def blocklist_check_api():
     reasons = {r.get("spamhaus_error") for r in results if r.get("spamhaus_error")}
     if errors and errors == len(results):
         if reasons:
-            payload["warning"] = (
-                "Spamhaus refused every query: " + "; ".join(sorted(reasons)) +
-                ". Set DNS_RESOLVERS=127.0.0.1 (unbound) or SPAMHAUS_DQS_KEY=your_key."
-            )
+            payload["warning"] = ("Spamhaus refused every query: " + "; ".join(sorted(reasons)) +
+                                  ". Set DNS_RESOLVERS=127.0.0.1 (unbound) or SPAMHAUS_DQS_KEY=your_key.")
         else:
-            payload["warning"] = (
-                "Every query returned an error. Retry in a minute or switch resolver."
-            )
+            payload["warning"] = "Every query returned an error. Retry in a minute or switch resolver."
     return jsonify(payload)
 
 
+# ============================================================
+# Email Hunter API
+# ============================================================
+@app.post("/api/email-hunter/start")
+def email_hunter_start():
+    if not HAS_HUNTER:
+        return jsonify(error="Email Hunter deps missing. Run: pip install requests beautifulsoup4"), 500
+    data = request.get_json(silent=True) or {}
+    url = str(data.get("url", "")).strip()
+    if not url:
+        return jsonify(error="URL is required"), 400
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    sid = secrets.token_urlsafe(12)
+    _hunter_status[sid] = "running"
+    _hunter_store[sid] = None
+
+    def _run():
+        try:
+            crawler = EmailHunterCrawler(url)
+            result = crawler.crawl()
+            _hunter_store[sid] = result
+            _hunter_status[sid] = "completed"
+        except Exception as e:
+            _hunter_store[sid] = {"error": str(e)}
+            _hunter_status[sid] = "error"
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify(session_id=sid, status="running")
+
+
+@app.get("/api/email-hunter/results/<sid>")
+def email_hunter_results(sid):
+    status = _hunter_status.get(sid, "unknown")
+    if status == "running":
+        return jsonify(status="running")
+    result = _hunter_store.get(sid) or {"error": "No results"}
+    return jsonify(status=status, **result)
+
+
+# ============================================================
+# Run
+# ============================================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
