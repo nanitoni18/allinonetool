@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: email-journeys
+    runtime: python
+    plan: free
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 300 --workers 1 --threads 8 --worker-class gthread
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: SECRET_KEY
+        generateValue: true
+      - key: LOGIN_USERNAME
+        value: admin
+      - key: LOGIN_PASSWORD
+        value: admin
+      - key: PORT
+        value: 10000
