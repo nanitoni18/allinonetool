@@ -33,16 +33,8 @@ try:
 except ImportError:
     HAS_CLOUDSCRAPER = False
 
-try:
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options as ChromeOptions
-    from selenium.webdriver.chrome.service import Service as ChromeService
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    HAS_SELENIUM = True
-except ImportError:
-    HAS_SELENIUM = False
+# Selenium disabled for Render free tier (heavy, causes build/deploy issues)
+HAS_SELENIUM = False
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET_123456789")
@@ -77,14 +69,22 @@ def _handle_any_error(e):
 
 
 # ============================================================
-# Email Hunter — deep crawler + subdomain hunter + selenium fallback
+# Health check (Render ku vendaam)
+# ============================================================
+@app.route("/healthz")
+def healthz():
+    return "ok", 200
+
+
+# ============================================================
+# Email Hunter — deep crawler + subdomain hunter
 # ============================================================
 if HAS_HUNTER:
     HUNTER_MAX_TIME = 240
     HUNTER_TIMEOUT = 20
     HUNTER_SUBDOMAIN_WORKERS = 24
     HUNTER_MAX_SUBDOMAINS = 30
-    HUNTER_SUBDOMAIN_FETCH_LIMIT = 12  # max subdomains to actually crawl
+    HUNTER_SUBDOMAIN_FETCH_LIMIT = 12
 
     HUNTER_UAS = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -173,71 +173,31 @@ if HAS_HUNTER:
         if not text:
             return set()
         found = set()
-
-        # Decode HTML entities for @ and .
         try:
             decoded = _HTML_ENTITY_AT.sub("@", text)
             decoded = _HTML_ENTITY_DOT.sub(".", decoded)
         except Exception:
             decoded = text
-
-        # 1) Straight emails
         for m in _EMAIL_RE.findall(decoded):
             e = m.strip().rstrip(".,;:").lower()
             if _is_valid_email(e):
                 found.add(e)
-
-        # 2) [at]/[dot] pattern
         for local, mid, tld in _OBFUSCATED_BRACKETS.findall(decoded):
             e = f"{local}@{mid}.{tld}".lower()
             if _is_valid_email(e):
                 found.add(e)
-
-        # 3) name @ domain . tld (with spaces)
         for local, mid, tld in _OBFUSCATED_SPACES.findall(decoded):
             e = f"{local}@{mid}.{tld}".lower()
             if _is_valid_email(e):
                 found.add(e)
-
-        # 4) name at domain dot tld
         for local, mid, tld in _OBFUSCATED_NOSYM.findall(decoded):
             e = f"{local}@{mid}.{tld}".lower()
             if _is_valid_email(e):
                 found.add(e)
-
         return found
 
-    def _make_selenium_driver():
-        if not HAS_SELENIUM:
-            return None
-        try:
-            opts = ChromeOptions()
-            opts.add_argument("--headless=new")
-            opts.add_argument("--no-sandbox")
-            opts.add_argument("--disable-dev-shm-usage")
-            opts.add_argument("--disable-gpu")
-            opts.add_argument("--disable-blink-features=AutomationControlled")
-            opts.add_argument("--window-size=1920,1080")
-            opts.add_argument("--lang=en-US,en;q=0.9")
-            opts.add_argument("--user-agent=" + random.choice(HUNTER_UAS))
-            opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-            opts.add_experimental_option("useAutomationExtension", False)
-            driver = webdriver.Chrome(options=opts)
-            driver.set_page_load_timeout(HUNTER_TIMEOUT)
-            try:
-                driver.execute_cdp_cmd(
-                    "Page.addScriptToEvaluateOnNewDocument",
-                    {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"}
-                )
-            except Exception:
-                pass
-            return driver
-        except Exception as e:
-            app.logger.warning("Selenium driver init failed: %s", e)
-            return None
-
     class EmailHunterCrawler:
-        def __init__(self, start_url, use_selenium=True):
+        def __init__(self, start_url):
             if "://" not in start_url:
                 start_url = "https://" + start_url
             self.start_url = start_url.rstrip("/")
@@ -260,10 +220,6 @@ if HAS_HUNTER:
                 except Exception:
                     self.scraper = None
 
-            self.driver = None
-            self.use_selenium = use_selenium and HAS_SELENIUM
-            self._selenium_used = 0
-
             self.subdomains_tried = set()
             self.subdomains_live = set()
 
@@ -279,14 +235,6 @@ if HAS_HUNTER:
             }
             self.start_time = None
             self._ua_index = 0
-
-        def _cleanup(self):
-            if self.driver:
-                try:
-                    self.driver.quit()
-                except Exception:
-                    pass
-                self.driver = None
 
         def _ua(self):
             self._ua_index = (self._ua_index + 1) % len(HUNTER_UAS)
@@ -424,32 +372,6 @@ if HAS_HUNTER:
 
             return links
 
-        def _fetch_selenium(self, url):
-            if not self.use_selenium:
-                return None
-            if self._selenium_used >= 20:
-                return None
-            try:
-                if self.driver is None:
-                    self.driver = _make_selenium_driver()
-                if self.driver is None:
-                    self.use_selenium = False
-                    return None
-                self.driver.get(url)
-                time.sleep(1.5)
-                html = self.driver.page_source or ""
-                self._selenium_used += 1
-                return html if len(html) > 50 else None
-            except Exception as e:
-                app.logger.warning("selenium fail %s: %s", url, e)
-                try:
-                    if self.driver:
-                        self.driver.quit()
-                except Exception:
-                    pass
-                self.driver = None
-                return None
-
         def _fetch(self, url, _retry=0):
             headers = {
                 "User-Agent": self._ua(),
@@ -503,12 +425,6 @@ if HAS_HUNTER:
                 except Exception as e:
                     app.logger.warning("HUNTER CS ERROR %s: %s", url, e)
 
-            # 3) Selenium (JS-rendered / hard Cloudflare)
-            html = self._fetch_selenium(url)
-            if html:
-                app.logger.info("HUNTER OK (selenium) %s len=%d", url, len(html))
-                return html
-
             self.stats["errors"] += 1
             app.logger.warning("HUNTER FAIL %s", url)
             return None
@@ -552,7 +468,6 @@ if HAS_HUNTER:
             return urls
 
         def _discover_subdomains(self):
-            """Probe common subdomains + cert transparency (crt.sh)."""
             found = set()
 
             def _check(sub):
@@ -608,7 +523,6 @@ if HAS_HUNTER:
                     self.stats["discovered"] += 1
 
         def _seed_host(self, host):
-            """Seed a host (domain or subdomain) into the queue."""
             base = f"https://{host}"
             self.queue.append(base)
             self.stats["discovered"] += 1
@@ -620,21 +534,18 @@ if HAS_HUNTER:
             self.start_time = time.time()
             self.queue.append(self.start_url)
 
-            # Sitemap seeds
             for sm in self._discover_sitemaps():
                 for u in self._parse_sitemap(sm):
                     if self._is_internal(u) and u not in self.visited:
                         self.queue.append(u)
                         self.stats["discovered"] += 1
 
-            # Common paths on start URL
             for path in HUNTER_GUESS_PATHS:
                 candidate = urljoin(self.start_url, path)
                 if self._is_internal(candidate) and candidate not in self.visited:
                     self.queue.append(candidate)
                     self.stats["discovered"] += 1
 
-            # Subdomain discovery
             try:
                 subs = self._discover_subdomains()
             except Exception:
@@ -643,7 +554,6 @@ if HAS_HUNTER:
             self.subdomains_live = set(subs)
             self.stats["subdomains_found"] = len(subs)
 
-            # Cap number of subdomains actually crawled
             crawl_subs = list(subs)[:HUNTER_SUBDOMAIN_FETCH_LIMIT]
             for host in crawl_subs:
                 self._seed_host(host)
@@ -687,7 +597,6 @@ if HAS_HUNTER:
                 new_links = self._extract_links(soup, url)
                 self._enqueue_many(new_links)
 
-            self._cleanup()
             self.stats["emails"] = len(self.emails)
             self.stats["time_taken"] = round(time.time() - self.start_time, 2)
             self.stats["subdomains_list"] = sorted(self.subdomains_live)
@@ -710,7 +619,6 @@ INDEX_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Email journeys — Neon Nexus</title>
-<meta name="description" content="Email journey toolkit — encoder, generators, blocklist checks and email hunter, in a neon-lit command center.">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -718,49 +626,26 @@ INDEX_HTML = r"""<!doctype html>
 <style>
 :root{
   --radius:18px;
-  --bg:#07080f;
-  --bg-soft:#0c0e18;
-  --panel:rgba(18,22,38,.72);
-  --panel-2:rgba(24,28,48,.6);
-  --panel-solid:#121626;
-  --text:#e9ecf8;
-  --text-soft:#a9b2cb;
-  --muted:#697391;
-  --line:rgba(120,140,220,.14);
-  --line-strong:rgba(140,160,240,.28);
-  --cyan:#00e5ff;
-  --magenta:#ff2d95;
-  --lime:#b8ff2b;
-  --violet:#a855f7;
-  --ok:#3ddc84;
-  --warn:#ffc247;
-  --danger:#ff5c8a;
-  --shadow:0 20px 50px rgba(0,0,0,.55);
-  --shadow-lg:0 34px 80px rgba(0,0,0,.7);
+  --bg:#07080f;--bg-soft:#0c0e18;--panel:rgba(18,22,38,.72);--panel-2:rgba(24,28,48,.6);
+  --panel-solid:#121626;--text:#e9ecf8;--text-soft:#a9b2cb;--muted:#697391;
+  --line:rgba(120,140,220,.14);--line-strong:rgba(140,160,240,.28);
+  --cyan:#00e5ff;--magenta:#ff2d95;--lime:#b8ff2b;--violet:#a855f7;
+  --ok:#3ddc84;--warn:#ffc247;--danger:#ff5c8a;
+  --shadow:0 20px 50px rgba(0,0,0,.55);--shadow-lg:0 34px 80px rgba(0,0,0,.7);
   --glow-cyan:0 0 40px rgba(0,229,255,.30);
 }
 body.light{
-  --bg:#eef1fa;--bg-soft:#e6ebf7;--panel:rgba(255,255,255,.82);
-  --panel-2:rgba(240,244,255,.7);--panel-solid:#ffffff;--text:#0c1224;
-  --text-soft:#3e4666;--muted:#6a7290;--line:rgba(20,30,80,.12);
-  --line-strong:rgba(20,30,80,.24);--cyan:#0091a8;--magenta:#c8177a;
-  --lime:#5f8f00;--violet:#6a2fd6;--ok:#1e8a4d;--warn:#b07700;--danger:#c02a5c;
+  --bg:#eef1fa;--bg-soft:#e6ebf7;--panel:rgba(255,255,255,.82);--panel-2:rgba(240,244,255,.7);
+  --panel-solid:#ffffff;--text:#0c1224;--text-soft:#3e4666;--muted:#6a7290;
+  --line:rgba(20,30,80,.12);--line-strong:rgba(20,30,80,.24);
+  --cyan:#0091a8;--magenta:#c8177a;--lime:#5f8f00;--violet:#6a2fd6;
+  --ok:#1e8a4d;--warn:#b07700;--danger:#c02a5c;
 }
 *,*::before,*::after{box-sizing:border-box}
 html{scroll-behavior:smooth}
-body{
-  margin:0;min-height:100vh;
-  font-family:'Space Grotesk',system-ui,-apple-system,'Segoe UI',Roboto,Arial,sans-serif;
-  background:var(--bg);color:var(--text);
-  -webkit-font-smoothing:antialiased;letter-spacing:-0.005em;overflow-x:hidden;
-  transition:background .35s ease,color .35s ease;
-}
+body{margin:0;min-height:100vh;font-family:'Space Grotesk',system-ui,-apple-system,'Segoe UI',Roboto,Arial,sans-serif;background:var(--bg);color:var(--text);-webkit-font-smoothing:antialiased;letter-spacing:-0.005em;overflow-x:hidden;transition:background .35s ease,color .35s ease}
 code,pre,.mono,.output{font-family:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-.bg-grid{position:fixed;inset:0;z-index:0;pointer-events:none;
-  background-image:linear-gradient(rgba(120,140,220,.06) 1px,transparent 1px),linear-gradient(90deg,rgba(120,140,220,.06) 1px,transparent 1px);
-  background-size:44px 44px;
-  mask-image:radial-gradient(ellipse 90% 70% at 50% 40%,#000 40%,transparent 100%);
-  -webkit-mask-image:radial-gradient(ellipse 90% 70% at 50% 40%,#000 40%,transparent 100%);}
+.bg-grid{position:fixed;inset:0;z-index:0;pointer-events:none;background-image:linear-gradient(rgba(120,140,220,.06) 1px,transparent 1px),linear-gradient(90deg,rgba(120,140,220,.06) 1px,transparent 1px);background-size:44px 44px;mask-image:radial-gradient(ellipse 90% 70% at 50% 40%,#000 40%,transparent 100%);-webkit-mask-image:radial-gradient(ellipse 90% 70% at 50% 40%,#000 40%,transparent 100%)}
 .bg-orbs{position:fixed;inset:0;overflow:hidden;pointer-events:none;z-index:0}
 .bg-orbs span{position:absolute;border-radius:50%;filter:blur(120px);opacity:.45;animation:drift 26s ease-in-out infinite}
 .bg-orbs span:nth-child(1){width:620px;height:620px;background:radial-gradient(circle,var(--cyan),transparent 70%);top:-220px;left:-180px}
@@ -823,7 +708,6 @@ body.light .nav button.active{color:#fff}
 .feat-tag{display:inline-block;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;letter-spacing:.14em;padding:3px 9px;border-radius:6px;color:var(--accent-color);background:color-mix(in srgb,var(--accent-color) 14%,transparent);border:1px solid color-mix(in srgb,var(--accent-color) 30%,transparent);margin-bottom:16px;text-transform:uppercase}
 .feat h3{margin:0 0 10px;font-size:20px;font-weight:600;letter-spacing:-.02em;line-height:1.25}
 .feat p{color:var(--text-soft);font-size:13.5px;line-height:1.7;margin:0}
-.feat-btn{display:inline-flex;align-items:center;gap:8px;margin-top:20px;font-size:13px;font-weight:600;color:var(--accent-color);cursor:pointer;border:0;background:transparent;padding:0;font-family:inherit;transition:.25s ease}
 .feat.wide{grid-column:span 6}
 .section-head{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;margin:4px 0 22px;flex-wrap:wrap}
 .section-head h2{margin:0;font-size:28px;letter-spacing:-.03em;font-weight:600}
@@ -897,22 +781,8 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
 .session-banner.show{display:block;animation:toastIn .3s ease}
 .session-banner b{background:linear-gradient(100deg,var(--cyan),var(--magenta));-webkit-background-clip:text;background-clip:text;color:transparent}
 .subs-list{margin-top:14px;padding:14px;border:1px dashed var(--line-strong);border-radius:12px;background:var(--panel-2);font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--text-soft);max-height:180px;overflow:auto;white-space:pre-wrap}
-@media(max-width:980px){
-  .home-wrap{grid-template-columns:1fr}
-  .feature-grid{grid-template-columns:1fr 1fr}
-  .feat,.feat.wide{grid-column:span 1}
-  .feat.wide{grid-column:span 2}
-  .quick-stats{grid-template-columns:repeat(2,1fr)}
-  .workspace,.controls3{grid-template-columns:1fr}
-  .bl-form{grid-template-columns:1fr}
-  .bl-summary{grid-template-columns:repeat(3,1fr)}
-}
-@media(max-width:640px){
-  .app{padding:14px 14px 0}.topbar{position:static}.nav{width:100%}.nav button{flex:1 1 auto}
-  .feature-grid{grid-template-columns:1fr}.feat,.feat.wide{grid-column:auto}
-  .quick-stats{grid-template-columns:repeat(2,1fr)}.bl-summary{grid-template-columns:repeat(2,1fr)}
-  .output-wrap{flex-direction:column}.copy-btn{padding:11px;width:100%}
-}
+@media(max-width:980px){.home-wrap{grid-template-columns:1fr}.feature-grid{grid-template-columns:1fr 1fr}.feat,.feat.wide{grid-column:span 1}.feat.wide{grid-column:span 2}.quick-stats{grid-template-columns:repeat(2,1fr)}.workspace,.controls3{grid-template-columns:1fr}.bl-form{grid-template-columns:1fr}.bl-summary{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:640px){.app{padding:14px 14px 0}.topbar{position:static}.nav{width:100%}.nav button{flex:1 1 auto}.feature-grid{grid-template-columns:1fr}.feat,.feat.wide{grid-column:auto}.quick-stats{grid-template-columns:repeat(2,1fr)}.bl-summary{grid-template-columns:repeat(2,1fr)}.output-wrap{flex-direction:column}.copy-btn{padding:11px;width:100%}}
 </style>
 </head>
 <body>
@@ -943,7 +813,6 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
     </nav>
   </header>
 
-  <!-- HOME -->
   <section id="home" class="page active">
     <div class="home-wrap">
       <div class="hero-left">
@@ -951,10 +820,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
           <span class="line-1">The email ops</span>
           <span class="line-2">command center.</span>
         </h1>
-        <p class="hero-desc">
-          Encode subject lines, forge identities, audit sending IPs, and hunt down
-          publicly available addresses — including across <code>subdomains</code>.
-        </p>
+        <p class="hero-desc">Encode subject lines, forge identities, audit sending IPs, and hunt down publicly available addresses — including across <code>subdomains</code>.</p>
         <div class="hero-actions">
           <button class="primary" onclick="showPage('hunter')">Run Email Hunter</button>
           <button class="secondary" onclick="showPage('converter');setMode('encode')">Launch Converter</button>
@@ -962,13 +828,10 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
       </div>
       <div class="hero-right">
         <div class="terminal">
-          <div class="term-bar">
-            <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-            <b>~ email-journeys --live</b>
-          </div>
+          <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><b>~ email-journeys --live</b></div>
           <div class="term-body">
             <div class="term-line"><span class="term-prompt">$</span><span class="term-out">hunter crawl --deep --subdomains</span></div>
-            <div class="term-line"><span class="term-prompt">→</span><span class="term-out cyan">requests + cloudscraper + selenium</span></div>
+            <div class="term-line"><span class="term-prompt">→</span><span class="term-out cyan">requests + cloudscraper</span></div>
             <div class="term-line"><span class="term-prompt">→</span><span class="term-out lime">mail · contact · info · support subs</span></div>
             <div class="term-line"><span class="term-prompt">→</span><span class="term-out magenta">mailto · obfuscated · HTML entities</span></div>
             <div class="term-line"><span class="term-prompt">✓</span><span class="term-out lime">ready</span><span class="term-cursor"></span></div>
@@ -976,68 +839,52 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
         </div>
       </div>
     </div>
-
     <div class="quick-stats">
       <div class="qs-card"><span class="qs-num">3</span><span class="qs-lbl">Q Encoders</span></div>
       <div class="qs-card"><span class="qs-num">4</span><span class="qs-lbl">DNSBL Zones</span></div>
       <div class="qs-card"><span class="qs-num">240s</span><span class="qs-lbl">Hunt Window</span></div>
       <div class="qs-card"><span class="qs-num">60m</span><span class="qs-lbl">Session</span></div>
     </div>
-
     <div class="feature-grid">
       <div class="feat f-cyan" onclick="showPage('converter');setMode('encode')">
-        <div class="feat-glow"></div>
-        <div class="feat-inner">
-          <span class="feat-tag">01 / ENCODE</span>
-          <h3>UTF-8 Q &amp; Base64 Converter</h3>
-          <p>Q methods 1–3 plus standard and underscore Base64. One-click copy.</p>
-        </div>
+        <div class="feat-glow"></div><div class="feat-inner">
+        <span class="feat-tag">01 / ENCODE</span>
+        <h3>UTF-8 Q &amp; Base64 Converter</h3>
+        <p>Q methods 1–3 plus standard and underscore Base64.</p></div>
       </div>
       <div class="feat f-magenta" onclick="showPage('converter');setMode('decode')">
-        <div class="feat-glow"></div>
-        <div class="feat-inner">
-          <span class="feat-tag">02 / DECODE</span>
-          <h3>Format-Aware Decoder</h3>
-          <p>Auto-detects Q and Base64 encoded-words. Strips invisible chars.</p>
-        </div>
+        <div class="feat-glow"></div><div class="feat-inner">
+        <span class="feat-tag">02 / DECODE</span>
+        <h3>Format-Aware Decoder</h3>
+        <p>Auto-detects Q and Base64 encoded-words.</p></div>
       </div>
       <div class="feat f-lime" onclick="showPage('generator')">
-        <div class="feat-glow"></div>
-        <div class="feat-inner">
-          <span class="feat-tag">03 / GENERATE</span>
-          <h3>Random Generators</h3>
-          <p>Secure strings, pronounceable words, brandable names.</p>
-        </div>
+        <div class="feat-glow"></div><div class="feat-inner">
+        <span class="feat-tag">03 / GENERATE</span>
+        <h3>Random Generators</h3>
+        <p>Secure strings, pronounceable words, brandable names.</p></div>
       </div>
       <div class="feat f-violet" onclick="showPage('blocklist')">
-        <div class="feat-glow"></div>
-        <div class="feat-inner">
-          <span class="feat-tag">04 / AUDIT</span>
-          <h3>Bulk Blocklist Check</h3>
-          <p>Up to 1,024 IPv4s vs Spamhaus ZEN and Barracuda. RDNS + DBL.</p>
-        </div>
+        <div class="feat-glow"></div><div class="feat-inner">
+        <span class="feat-tag">04 / AUDIT</span>
+        <h3>Bulk Blocklist Check</h3>
+        <p>Spamhaus ZEN + Barracuda + RDNS + DBL.</p></div>
       </div>
       <div class="feat f-cyan wide" onclick="showPage('hunter')">
-        <div class="feat-glow"></div>
-        <div class="feat-inner">
-          <span class="feat-tag">05 / HUNT · DEEP CRAWL · SUBDOMAINS</span>
-          <h3>Email Hunter — Multi-layer Crawler</h3>
-          <p>Requests + cloudscraper + Selenium. Discovers and crawls subdomains like <code>mail.</code>, <code>contact.</code>, <code>info.</code>, <code>support.</code> via DNS wordlist and crt.sh certificate transparency. Extracts plain, mailto, obfuscated, and HTML-entity-encoded emails. Deduplicates. Public content only.</p>
-        </div>
+        <div class="feat-glow"></div><div class="feat-inner">
+        <span class="feat-tag">05 / HUNT · DEEP CRAWL · SUBDOMAINS</span>
+        <h3>Email Hunter — Multi-layer Crawler</h3>
+        <p>Requests + cloudscraper. Discovers and crawls subdomains via DNS wordlist and crt.sh. Extracts plain, mailto, obfuscated, and HTML-entity emails. Public content only.</p></div>
       </div>
     </div>
   </section>
 
-  <!-- CONVERTER -->
   <section id="converter" class="page">
-    <div class="section-head">
-      <div><h2>UTF-8 &amp; Base64 <span class="accent">Converter</span></h2><p>Switch between Encode and Decode.</p></div>
-    </div>
+    <div class="section-head"><div><h2>UTF-8 &amp; Base64 <span class="accent">Converter</span></h2><p>Switch between Encode and Decode.</p></div></div>
     <div class="tabs">
       <button id="encode-tab" class="tab active" onclick="setMode('encode')">Encode</button>
       <button id="decode-tab" class="tab" onclick="setMode('decode')">Decode</button>
     </div>
-
     <div id="encode-panel">
       <div class="workspace">
         <div class="card">
@@ -1051,25 +898,19 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
         </div>
         <div class="card">
           <h3>UTF-8 Q Outputs</h3>
-          <div class="result"><label class="label">Q Method 1</label>
-            <div class="output-wrap"><div id="q1" class="output"></div><button class="copy-btn" onclick="copyText('q1',this)">Copy</button></div></div>
-          <div class="result"><label class="label">Q Method 2</label>
-            <div class="output-wrap"><div id="q2" class="output"></div><button class="copy-btn" onclick="copyText('q2',this)">Copy</button></div></div>
-          <div class="result"><label class="label">Q Method 3</label>
-            <div class="output-wrap"><div id="q3" class="output"></div><button class="copy-btn" onclick="copyText('q3',this)">Copy</button></div></div>
+          <div class="result"><label class="label">Q Method 1</label><div class="output-wrap"><div id="q1" class="output"></div><button class="copy-btn" onclick="copyText('q1',this)">Copy</button></div></div>
+          <div class="result"><label class="label">Q Method 2</label><div class="output-wrap"><div id="q2" class="output"></div><button class="copy-btn" onclick="copyText('q2',this)">Copy</button></div></div>
+          <div class="result"><label class="label">Q Method 3</label><div class="output-wrap"><div id="q3" class="output"></div><button class="copy-btn" onclick="copyText('q3',this)">Copy</button></div></div>
         </div>
       </div>
       <div class="card" style="margin-top:18px">
         <h3>Base64 Outputs</h3>
         <div class="workspace">
-          <div><label class="label">Standard Base64</label>
-            <div class="output-wrap"><div id="b64" class="output"></div><button class="copy-btn" onclick="copyText('b64',this)">Copy</button></div></div>
-          <div><label class="label">Underscore Base64</label>
-            <div class="output-wrap"><div id="b64u" class="output"></div><button class="copy-btn" onclick="copyText('b64u',this)">Copy</button></div></div>
+          <div><label class="label">Standard Base64</label><div class="output-wrap"><div id="b64" class="output"></div><button class="copy-btn" onclick="copyText('b64',this)">Copy</button></div></div>
+          <div><label class="label">Underscore Base64</label><div class="output-wrap"><div id="b64u" class="output"></div><button class="copy-btn" onclick="copyText('b64u',this)">Copy</button></div></div>
         </div>
       </div>
     </div>
-
     <div id="decode-panel" class="hidden">
       <div class="notice">Paste any UTF-8 Q or Base64 encoded-word. Format is detected automatically.</div>
       <div class="card">
@@ -1081,13 +922,11 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
           <button class="secondary" onclick="clearDecode()">Clear</button>
         </div>
         <div class="result"><label class="label">Detected format</label><div id="detected" class="output" style="min-height:56px"></div></div>
-        <div class="result"><label class="label">Output</label>
-          <div class="output-wrap"><div id="dec-output" class="output" style="min-height:110px"></div><button class="copy-btn" onclick="copyText('dec-output',this)">Copy</button></div></div>
+        <div class="result"><label class="label">Output</label><div class="output-wrap"><div id="dec-output" class="output" style="min-height:110px"></div><button class="copy-btn" onclick="copyText('dec-output',this)">Copy</button></div></div>
       </div>
     </div>
   </section>
 
-  <!-- GENERATORS -->
   <section id="generator" class="page">
     <div class="section-head"><div><h2>Random <span class="accent">Generators</span></h2><p>Strings, words, names.</p></div></div>
     <div class="tabs">
@@ -1095,7 +934,6 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
       <button id="gen-word-tab" class="tab" onclick="genTab('word')">Random Words</button>
       <button id="gen-name-tab" class="tab" onclick="genTab('name')">Name Generator</button>
     </div>
-
     <div id="gen-string" class="card gen-panel">
       <h3>Random String Generator</h3>
       <p class="helper">Cryptographically secure RNG.</p>
@@ -1113,7 +951,6 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
       <textarea id="stringOut" readonly placeholder="Results appear here…"></textarea>
       <div id="stringStatus" class="status"></div>
     </div>
-
     <div id="gen-word" class="card gen-panel hidden">
       <h3>Random Words Generator</h3>
       <p class="helper">Pronounceable consonant–vowel patterns.</p>
@@ -1131,7 +968,6 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
       <textarea id="wordOut" readonly placeholder="Results appear here…"></textarea>
       <div id="wordStatus" class="status"></div>
     </div>
-
     <div id="gen-name" class="card gen-panel hidden">
       <h3>Name Generator</h3>
       <p class="helper">2 or 3 parts joined with <code>-</code>, <code>.</code> or <code>_</code>.</p>
@@ -1149,14 +985,8 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
     </div>
   </section>
 
-  <!-- BLOCKLIST -->
   <section id="blocklist" class="page">
-    <div class="section-head">
-      <div>
-        <h2>Bulk <span class="accent">Blocklist Check</span></h2>
-        <p>Spamhaus ZEN (CSS / PBL / SBL / XBL) + Barracuda + RDNS + DBL.</p>
-      </div>
-    </div>
+    <div class="section-head"><div><h2>Bulk <span class="accent">Blocklist Check</span></h2><p>Spamhaus ZEN (CSS / PBL / SBL / XBL) + Barracuda + RDNS + DBL.</p></div></div>
     <div class="card">
       <div class="bl-form">
         <div class="bl-field"><label for="bl-first-ip">First IP address</label><input id="bl-first-ip" type="text" placeholder="66.78.52.2" autocomplete="off"></div>
@@ -1180,15 +1010,13 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
     </div>
   </section>
 
-  <!-- EMAIL HUNTER -->
   <section id="hunter" class="page">
     <div class="section-head">
       <div>
         <h2>Email <span class="accent">Hunter</span></h2>
-        <p>Enter any website URL. The hunter crawls its public pages <em>and discovers subdomains</em> (via DNS wordlist + crt.sh certificate transparency) then crawls their contact pages too. Uses requests, cloudscraper (Cloudflare), and Selenium (JS-rendered) automatically. Extracts plain, <code>mailto:</code>, obfuscated (<code>[at]</code> / <code>(at)</code> / <code>at ... dot</code>), and HTML-entity-encoded emails.</p>
+        <p>Enter any website URL. The hunter crawls its public pages <em>and discovers subdomains</em> (DNS wordlist + crt.sh). Uses requests + cloudscraper. Extracts plain, <code>mailto:</code>, obfuscated, and HTML-entity emails.</p>
       </div>
     </div>
-
     <div class="card">
       <label class="label" for="hunter-url">Website URL</label>
       <div style="display:flex;gap:10px;flex-wrap:wrap">
@@ -1201,14 +1029,11 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
         <div class="bl-progress-bar" id="hunter-progress-bar" style="width:8%"></div>
       </div>
     </div>
-
     <div id="hunter-stats" class="bl-summary hidden" style="margin-top:20px"></div>
-
     <div class="card" id="hunter-subs-card" style="margin-top:20px;display:none">
       <h3>Subdomains Found (<span id="hunter-subs-count">0</span>)</h3>
       <div class="subs-list" id="hunter-subs-list"></div>
     </div>
-
     <div class="card" id="hunter-emails-card" style="margin-top:20px;display:none">
       <h3>Emails Found (<span id="hunter-count">0</span>)</h3>
       <div class="actions" style="margin-top:0;margin-bottom:12px">
@@ -1228,26 +1053,17 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
 const $ = (id) => document.getElementById(id);
 const PAGES = ['home', 'converter', 'generator', 'blocklist', 'hunter'];
 const state = { blAbort: null, blData: null };
-
 const SESSION_MAX_AGE_MS = 60 * 60 * 1000;
 const SESSION_START_KEY = 'ej_session_start';
 const SESSION_BANNER_DELAY_MS = 55 * 60 * 1000;
-
 function sessionStart() {
   let t = parseInt(sessionStorage.getItem(SESSION_START_KEY) || '0', 10);
-  if (!t || Date.now() - t > SESSION_MAX_AGE_MS) {
-    t = Date.now();
-    sessionStorage.setItem(SESSION_START_KEY, String(t));
-  }
+  if (!t || Date.now() - t > SESSION_MAX_AGE_MS) { t = Date.now(); sessionStorage.setItem(SESSION_START_KEY, String(t)); }
   return t;
 }
 function checkSession() {
   const elapsed = Date.now() - sessionStart();
-  if (elapsed >= SESSION_MAX_AGE_MS) {
-    sessionStorage.removeItem(SESSION_START_KEY);
-    window.location.href = '/login?expired=1';
-    return false;
-  }
+  if (elapsed >= SESSION_MAX_AGE_MS) { sessionStorage.removeItem(SESSION_START_KEY); window.location.href = '/login?expired=1'; return false; }
   return true;
 }
 function updateSessionBanner() {
@@ -1263,7 +1079,6 @@ function updateSessionBanner() {
 }
 sessionStart();
 setInterval(function () { if (checkSession()) updateSessionBanner(); }, 1000);
-
 function showPage(name) {
   if (!checkSession()) return;
   PAGES.forEach((p) => $(p).classList.toggle('active', p === name));
@@ -1295,20 +1110,13 @@ function toggleTheme() {
   document.body.classList.toggle('light', light);
   $('theme-btn').textContent = light ? '☾' : '☀';
 })();
-function logoutUser() {
-  sessionStorage.removeItem(SESSION_START_KEY);
-  window.location.href = '/logout';
-}
+function logoutUser() { sessionStorage.removeItem(SESSION_START_KEY); window.location.href = '/logout'; }
 function toast(message, kind) {
   const el = document.createElement('div');
   el.className = 'toast ' + (kind || '');
   el.textContent = message;
   $('toasts').appendChild(el);
-  setTimeout(() => {
-    el.style.transition = 'opacity .25s, transform .25s';
-    el.style.opacity = '0'; el.style.transform = 'translateY(10px)';
-    setTimeout(() => el.remove(), 260);
-  }, 2600);
+  setTimeout(() => { el.style.transition = 'opacity .25s, transform .25s'; el.style.opacity = '0'; el.style.transform = 'translateY(10px)'; setTimeout(() => el.remove(), 260); }, 2600);
 }
 function legacyCopy(value) {
   const ta = document.createElement('textarea');
@@ -1334,7 +1142,6 @@ function copyArea(id, btn) { copyValue($(id).value, btn); }
 function clearBox(id) { $(id).value = ''; }
 function clearArea(id) { $(id).value = ''; }
 function clearDecode() { $('dec-input').value = ''; $('dec-output').textContent = ''; $('detected').textContent = ''; }
-
 async function api(url, opts) {
   const res = await fetch(url, opts);
   if (res.status === 401) { sessionStorage.removeItem(SESSION_START_KEY); window.location.href = '/login?expired=1'; throw new Error('Session expired'); }
@@ -1344,15 +1151,11 @@ async function api(url, opts) {
   if (!res.ok) throw new Error(data.error || ('Request failed (HTTP ' + res.status + ')'));
   return data;
 }
-
 async function encodeText() {
   const text = $('enc-input').value;
   if (!text) { ['q1', 'q2', 'q3', 'b64', 'b64u'].forEach((x) => { $(x).textContent = ''; }); return; }
   try {
-    const d = await api('/api/encode', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: text })
-    });
+    const d = await api('/api/encode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: text }) });
     $('q1').textContent = d.q1; $('q2').textContent = d.q2; $('q3').textContent = d.q3;
     $('b64').textContent = d.base64; $('b64u').textContent = d.base64_underscore;
   } catch (e) { toast(e.message, 'err'); }
@@ -1393,11 +1196,7 @@ async function generateNames() {
     $('nameOut').value = d.results.join('\n'); $('nameStatus').textContent = d.results.length + ' names generated';
   } catch (e) { $('nameStatus').textContent = e.message; toast(e.message, 'err'); }
 }
-function esc(v) {
-  return String(v === null || v === undefined ? '' : v).replace(/[&<>"']/g, function (c) {
-    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-  });
-}
+function esc(v) { return String(v === null || v === undefined ? '' : v).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
 function pill(v) {
   const s = String(v || 'N/A').toUpperCase();
   if (s === 'LISTED') return '<span class="bl-status-pill bl-listed">LISTED</span>';
@@ -1409,12 +1208,7 @@ async function refreshHealth() {
   try {
     const d = await api('/api/blocklist/health', { method: 'GET' });
     const color = d.spamhaus_ok ? 'var(--ok)' : 'var(--danger)';
-    $('bl-health').innerHTML =
-      'Resolver: <b>' + esc((d.nameservers || []).join(', ') || 'system') + '</b>' +
-      ' · Backend: <b>' + esc(d.dns_backend) + '</b>' +
-      ' · DQS: <b>' + (d.dqs ? 'ON' : 'OFF') + '</b>' +
-      ' · <span style="color:' + color + '">Spamhaus: <b>' + (d.spamhaus_ok ? 'OK' : 'BLOCKED') + '</b></span>' +
-      (d.spamhaus_note ? ' — ' + esc(d.spamhaus_note) : '');
+    $('bl-health').innerHTML = 'Resolver: <b>' + esc((d.nameservers || []).join(', ') || 'system') + '</b> · Backend: <b>' + esc(d.dns_backend) + '</b> · DQS: <b>' + (d.dqs ? 'ON' : 'OFF') + '</b> · <span style="color:' + color + '">Spamhaus: <b>' + (d.spamhaus_ok ? 'OK' : 'BLOCKED') + '</b></span>' + (d.spamhaus_note ? ' — ' + esc(d.spamhaus_note) : '');
   } catch (e) { $('bl-health').textContent = 'Health check failed: ' + e.message; }
 }
 function renderSummary(t) {
@@ -1439,22 +1233,15 @@ async function checkBlocklist() {
   if (!first || !last) { status.textContent = 'Enter both First and Last IP.'; toast('Both IP fields required', 'err'); return; }
   state.blAbort = new AbortController();
   const startedAt = Date.now();
-  const tick = setInterval(function () {
-    status.textContent = 'Checking ' + first + ' → ' + last + '… ' + ((Date.now() - startedAt) / 1000).toFixed(0) + 's';
-  }, 1000);
+  const tick = setInterval(function () { status.textContent = 'Checking ' + first + ' → ' + last + '… ' + ((Date.now() - startedAt) / 1000).toFixed(0) + 's'; }, 1000);
   btn.disabled = true; btn.textContent = 'Checking…'; cancelBtn.disabled = false;
   status.textContent = 'Checking ' + first + ' → ' + last + '…';
   progress.classList.remove('hidden'); bar.style.width = '8%';
   $('bl-results').classList.add('hidden'); $('bl-summary').classList.add('hidden');
   $('bl-export-wrap').style.display = 'none'; state.blData = null;
   try {
-    const d = await api('/api/blocklist/check', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ first_ip: first, last_ip: last }),
-      signal: state.blAbort.signal
-    });
-    bar.style.width = '100%';
-    state.blData = d;
+    const d = await api('/api/blocklist/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ first_ip: first, last_ip: last }), signal: state.blAbort.signal });
+    bar.style.width = '100%'; state.blData = d;
     renderSummary(d.totals); renderResults(d.results, d.totals);
     $('bl-export-wrap').style.display = 'flex';
     let msg = 'Completed ' + d.results.length + ' IP checks in ' + d.elapsed + 's.';
@@ -1488,7 +1275,6 @@ function exportBlocklistCsv() {
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   URL.revokeObjectURL(url); toast('CSV exported', 'ok');
 }
-
 const hunterState = { abort: null, sid: null, pollTimer: null, data: null };
 async function startEmailHunter() {
   const url = $('hunter-url').value.trim();
@@ -1510,13 +1296,9 @@ async function startEmailHunter() {
   }, 1000);
   status.textContent = 'Starting crawl…';
   try {
-    const d = await api('/api/email-hunter/start', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: url }), signal: hunterState.abort.signal
-    });
+    const d = await api('/api/email-hunter/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: url }), signal: hunterState.abort.signal });
     hunterState.sid = d.session_id;
-    clearInterval(tick);
-    pollHunterResults(startedAt, tick);
+    clearInterval(tick); pollHunterResults(startedAt, tick);
   } catch (e) {
     clearInterval(tick); finishHunterUi();
     if (e.name === 'AbortError') status.textContent = 'Cancelled.';
@@ -1545,14 +1327,9 @@ function displayHunterResults(d) {
   const s = d.stats || {};
   const stats = $('hunter-stats');
   const items = [
-    ['Emails', s.emails || 0],
-    ['Pages', s.pages_visited || 0],
-    ['Contact', s.contact_pages || 0],
-    ['Subs Found', s.subdomains_found || 0],
-    ['Subs Visited', s.subdomains_visited || 0],
-    ['Discovered', s.discovered || 0],
-    ['Errors', s.errors || 0],
-    ['Time (s)', s.time_taken || 0],
+    ['Emails', s.emails || 0], ['Pages', s.pages_visited || 0], ['Contact', s.contact_pages || 0],
+    ['Subs Found', s.subdomains_found || 0], ['Subs Visited', s.subdomains_visited || 0],
+    ['Discovered', s.discovered || 0], ['Errors', s.errors || 0], ['Time (s)', s.time_taken || 0],
   ];
   stats.innerHTML = items.map(function (x) { return '<div class="bl-summary-item"><b>' + esc(x[1]) + '</b><span>' + esc(x[0]) + '</span></div>'; }).join('');
   stats.classList.remove('hidden');
@@ -1564,9 +1341,7 @@ function displayHunterResults(d) {
   $('hunter-count').textContent = emails.length;
   $('hunter-emails').textContent = emails.length ? emails.join('\n') : 'No emails found.';
   $('hunter-emails-card').style.display = 'block';
-  $('hunter-status').textContent = 'Done — ' + emails.length + ' email' + (emails.length === 1 ? '' : 's') +
-    ', ' + subs.length + ' subdomain' + (subs.length === 1 ? '' : 's') +
-    ' in ' + (s.time_taken || 0) + 's.';
+  $('hunter-status').textContent = 'Done — ' + emails.length + ' email' + (emails.length === 1 ? '' : 's') + ', ' + subs.length + ' subdomain' + (subs.length === 1 ? '' : 's') + ' in ' + (s.time_taken || 0) + 's.';
 }
 function finishHunterUi() {
   const btn = $('hunter-btn');
@@ -1593,10 +1368,8 @@ function exportHunterCsv() {
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   URL.revokeObjectURL(url); toast('CSV exported', 'ok');
 }
-
 $('year').textContent = new Date().getFullYear();
 showPage('home');
-
 document.addEventListener('keydown', function (e) {
   if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
     const active = document.activeElement;
@@ -1611,19 +1384,21 @@ document.addEventListener('keydown', function (e) {
 
 
 # ============================================================
-# Auth
+# Auth (with healthz bypass)
 # ============================================================
 @app.before_request
 def auth():
-    public = {"login", "favicon", "favicon_ico", "bimi"}
+    public = {"login", "favicon", "favicon_ico", "bimi", "healthz"}
     if request.endpoint in public:
         return
-    if request.path in ("/favicon.svg", "/favicon.ico", "/bimi-logo.svg"):
+    if request.path in ("/favicon.svg", "/favicon.ico", "/bimi-logo.svg", "/healthz"):
         return
+
     if not session.get("logged_in"):
         if request.path.startswith("/api/"):
             return jsonify(success=False, error="Login required"), 401
         return redirect(url_for("login", next=request.path))
+
     login_time = session.get("login_time", 0)
     if time.time() - login_time > SESSION_MAX_AGE:
         session.clear()
@@ -1941,15 +1716,11 @@ else:
 BARRACUDA_ZONE = "b.barracudacentral.org"
 
 ZEN_CODES = {
-    "127.0.0.2": "SBL",
-    "127.0.0.3": "SBL CSS",
-    "127.0.0.4": "XBL (CBL)",
-    "127.0.0.5": "XBL (CBL)",
-    "127.0.0.6": "XBL (CBL)",
-    "127.0.0.7": "XBL (CBL)",
+    "127.0.0.2": "SBL", "127.0.0.3": "SBL CSS",
+    "127.0.0.4": "XBL (CBL)", "127.0.0.5": "XBL (CBL)",
+    "127.0.0.6": "XBL (CBL)", "127.0.0.7": "XBL (CBL)",
     "127.0.0.9": "SBL DROP/EDROP",
-    "127.0.0.10": "PBL (ISP)",
-    "127.0.0.11": "PBL (Spamhaus)",
+    "127.0.0.10": "PBL (ISP)", "127.0.0.11": "PBL (Spamhaus)",
 }
 
 SPAMHAUS_ERROR_CODES = {
