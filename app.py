@@ -1,7 +1,7 @@
 # ============================================================
 # Email journeys — Single-file Flask App (Cloud Light + Night)
 # Multi-URL Email Hunter · Theme Toggle · Session 1 hour
-# Real-browser UA · Per-domain fairness · Round-robin crawl
+# Deep crawler: URL guessing · 6-level depth · inline JS extraction
 # ============================================================
 from flask import Flask, request, jsonify, session, redirect, url_for, Response
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -51,23 +51,50 @@ def _handle_any_error(e):
 
 
 # ============================================================
-# Email Hunter — multi-domain crawler
+# Email Hunter — deep multi-domain crawler
 # ============================================================
 if HAS_HUNTER:
     HUNTER_MAX_TIME = 120
-    HUNTER_TIMEOUT = 15
-    HUNTER_MIN_PER_DOMAIN = 20
+    HUNTER_TIMEOUT = 12
+    HUNTER_MIN_PER_DOMAIN = 30
+    HUNTER_MAX_DEPTH = 6
 
     HUNTER_UAS = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
     ]
-    HUNTER_LINK_ATTRS = ["href", "src", "data-url", "data-href", "onclick"]
+
+    HUNTER_LINK_ATTRS = [
+        "href", "src", "data-url", "data-href", "data-link", "data-target",
+        "data-page", "data-route", "action", "formaction", "onclick"
+    ]
+
     HUNTER_CONTACT_KEYWORDS = [
-        "contact", "kontakt", "impressum", "about", "team",
-        "directory", "service", "support", "help", "info"
+        "contact", "about", "team", "people", "staff", "directory",
+        "support", "help", "info", "reach", "connect", "hello",
+        "kontakt", "impressum", "uber", "ueber", "ansprechpartner",
+        "mitarbeiter", "datenschutz", "wir",
+        "equipe", "apropos", "a-propos", "nous",
+        "contacto", "equipo", "acerca", "nosotros", "sobre",
+        "contatti", "chi-siamo", "informazioni",
+        "over-ons", "medewerkers",
+    ]
+
+    HUNTER_GUESS_PATHS = [
+        "/contact", "/contact-us", "/contacts", "/about", "/about-us",
+        "/team", "/our-team", "/people", "/staff", "/directory",
+        "/support", "/help", "/info", "/company", "/careers",
+        "/kontakt", "/impressum", "/uber-uns", "/ueber-uns",
+        "/ansprechpartner", "/mitarbeiter", "/datenschutz",
+        "/wir-uber-uns", "/wir-ueber-uns", "/personen",
+        "/generalvikariat", "/ordinariat", "/bistum", "/stellenangebote",
+        "/equipe", "/a-propos", "/apropos", "/nous-contacter",
+        "/contacto", "/equipo", "/acerca-de", "/nosotros", "/quienes-somos",
+        "/contatti", "/chi-siamo", "/informazioni",
+        "/imprint", "/legal", "/privacy", "/mentions-legales",
     ]
 
     _EMAIL_RE = _re_h.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
@@ -77,8 +104,19 @@ if HAS_HUNTER:
         r"([a-zA-Z]{2,})",
         _re_h.IGNORECASE
     )
+    _SPACED_EMAIL_RE = _re_h.compile(
+        r"([a-zA-Z0-9._%+\-]+)\s*@\s*([a-zA-Z0-9.\-]+)\s*\.\s*([a-zA-Z]{2,})"
+    )
+
     _BAD_EXT = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp",
-                ".css", ".js", ".ico", ".woff", ".woff2", ".ttf")
+                ".css", ".js", ".ico", ".woff", ".woff2", ".ttf",
+                ".pdf", ".zip", ".mp4", ".mp3", ".doc", ".docx",
+                ".xls", ".xlsx", ".ppt", ".pptx", ".avi", ".mov")
+
+    _SKIP_PATTERNS = (
+        "/wp-admin", "/wp-login", "/wp-json", "/feed/", "?replytocom",
+        "/cdn-cgi/", "/.well-known/", "/wp-content/cache",
+    )
 
     def _is_valid_email(e):
         if not e or len(e) > 254 or e.count("@") != 1:
@@ -92,7 +130,9 @@ if HAS_HUNTER:
             return False
         if local.startswith(".") or local.endswith("."):
             return False
-        if len(local) < 2:
+        if len(local) < 2 or len(local) > 64:
+            return False
+        if not _re_h.match(r"^[a-zA-Z0-9._%+\-]+$", local):
             return False
         return True
 
@@ -106,11 +146,36 @@ if HAS_HUNTER:
             e = f"{local}@{mid}.{tld}".lower()
             if _is_valid_email(e):
                 found.add(e)
+        for local, mid, tld in _SPACED_EMAIL_RE.findall(text):
+            e = f"{local}@{mid}.{tld}".lower()
+            if _is_valid_email(e):
+                found.add(e)
         return found
 
-    class EmailHunterCrawler:
-        """Multi-domain crawler with per-domain fairness and real-browser UAs."""
+    def _normalize_path(url):
+        try:
+            p = urlparse(url)
+            path = p.path or "/"
+            while "//" in path:
+                path = path.replace("//", "/")
+            for idx in ("index.html", "index.htm", "index.php", "default.html"):
+                if path.endswith("/" + idx):
+                    path = path[: -len(idx)]
+            query = p.query
+            if query:
+                kept = []
+                for part in query.split("&"):
+                    if not part.lower().startswith(("utm_", "fbclid", "gclid")):
+                        kept.append(part)
+                query = "&".join(kept)
+            netloc = p.netloc.lower()
+            if netloc.startswith("www."):
+                netloc = netloc[4:]
+            return urlunparse((p.scheme.lower() or "https", netloc, path, "", query, ""))
+        except Exception:
+            return url
 
+    class EmailHunterCrawler:
         def __init__(self, start_urls):
             if isinstance(start_urls, str):
                 start_urls = [start_urls]
@@ -120,6 +185,7 @@ if HAS_HUNTER:
             self.per_domain_queue = {}
             self.domain_visited = {}
             self.domain_email_set = {}
+            self.seen_normalized = set()
             self.visited = set()
             self.emails = set()
             self.stats = {
@@ -137,6 +203,7 @@ if HAS_HUNTER:
                     continue
                 key = netloc[4:] if netloc.startswith("www.") else netloc
                 self.domain_map[netloc] = key
+                self.domain_map["www." + key] = key
                 self.domains.add(netloc)
                 self.domains.add("www." + key)
                 self.domains.add(key)
@@ -158,6 +225,13 @@ if HAS_HUNTER:
 
         def _normalize(self, base, link):
             try:
+                if not link or link.strip() in ("#", "javascript:void(0)", "javascript:;"):
+                    return None
+                low = link.lower().strip()
+                if any(low.startswith(p) for p in ("mailto:", "tel:", "javascript:", "whatsapp:", "sms:", "fax:")):
+                    return None
+                if any(skip in low for skip in _SKIP_PATTERNS):
+                    return None
                 absolute = urljoin(base, link)
                 p = urlparse(absolute)
                 if p.scheme not in ("http", "https"):
@@ -172,33 +246,69 @@ if HAS_HUNTER:
 
         def _extract_links(self, soup, base_url):
             links = set()
+
             for tag in soup.find_all(True):
                 for attr in HUNTER_LINK_ATTRS:
-                    val = tag.get(attr)
+                    try:
+                        val = tag.get(attr)
+                    except Exception:
+                        continue
                     if not val:
                         continue
+                    if isinstance(val, list):
+                        val = " ".join(str(x) for x in val)
+                    val = str(val)
+
                     if attr == "onclick":
-                        m = _re_h.search(r"['\"]([^'\"]+)['\"]", str(val))
-                        if m:
-                            val = m.group(1)
-                        else:
-                            continue
+                        for m in _re_h.finditer(r"['\"]([^'\"]+)['\"]", val):
+                            cand = self._normalize(base_url, m.group(1))
+                            if cand and self._is_internal(cand):
+                                links.add(cand)
+                        for m in _re_h.finditer(r"location\.href\s*=\s*['\"]([^'\"]+)['\"]", val):
+                            cand = self._normalize(base_url, m.group(1))
+                            if cand and self._is_internal(cand):
+                                links.add(cand)
+                        continue
+
+                    if attr.startswith("data-"):
+                        cand = self._normalize(base_url, val)
+                        if cand and self._is_internal(cand):
+                            links.add(cand)
+                        for m in _re_h.finditer(r"['\"]([a-zA-Z0-9_\-./:?=&%]+)['\"]", val):
+                            inner = m.group(1)
+                            if inner.startswith(("/", "http")):
+                                c2 = self._normalize(base_url, inner)
+                                if c2 and self._is_internal(c2):
+                                    links.add(c2)
+                        continue
+
                     cand = self._normalize(base_url, val)
                     if cand and self._is_internal(cand):
                         links.add(cand)
+
+            for script in soup.find_all("script"):
+                txt = script.string or script.get_text() or ""
+                if not txt:
+                    continue
+                for m in _re_h.finditer(r"['\"](/[a-zA-Z0-9_\-/]{2,})['\"]", txt):
+                    cand = self._normalize(base_url, m.group(1))
+                    if cand and self._is_internal(cand):
+                        links.add(cand)
+
             return links
 
         def _fetch(self, url):
             headers = {
                 "User-Agent": self._ua(),
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9,de;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9,de;q=0.8,fr;q=0.7",
                 "Accept-Encoding": "gzip, deflate, br",
                 "Connection": "keep-alive",
                 "Upgrade-Insecure-Requests": "1",
                 "Sec-Fetch-Dest": "document",
                 "Sec-Fetch-Mode": "navigate",
                 "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
                 "Cache-Control": "max-age=0",
             }
             try:
@@ -234,36 +344,51 @@ if HAS_HUNTER:
                             sitemaps.append(line.split(":", 1)[1].strip())
             except Exception:
                 pass
-            for path in ["/sitemap.xml", "/sitemap", "/site-map", "/sitemap_index.xml"]:
+            for path in ["/sitemap.xml", "/sitemap", "/site-map", "/sitemap_index.xml",
+                         "/sitemap-index.xml", "/sitemap1.xml"]:
                 sitemaps.append(urljoin(base_url, path))
             return list(set(sitemaps))
 
-        def _parse_sitemap(self, sm_url):
+        def _parse_sitemap(self, sm_url, depth=0):
             urls = set()
+            if depth > 2:
+                return urls
             try:
                 r = requests.get(sm_url, headers={"User-Agent": self._ua()}, timeout=10)
                 if r.status_code != 200:
                     return urls
                 soup = BeautifulSoup(r.text, "xml")
+                for sm in soup.find_all("sitemap"):
+                    loc = sm.find("loc")
+                    if loc and loc.text:
+                        urls.update(self._parse_sitemap(loc.text.strip(), depth + 1))
                 for loc in soup.find_all("loc"):
                     urls.add(loc.text.strip())
             except Exception:
                 pass
             return urls
 
-        def _enqueue(self, url):
+        def _enqueue(self, url, depth=0):
             if url in self.visited:
                 return False
+            norm = _normalize_path(url)
+            if norm in self.seen_normalized:
+                return False
+            self.seen_normalized.add(norm)
             key = self._domain_key(url)
             q = self.per_domain_queue.setdefault(key, _deque_h())
-            if url in q:
-                return False
             if self._is_contact(url):
-                q.appendleft(url)
+                q.appendleft((url, depth))
             else:
-                q.append(url)
+                q.append((url, depth))
             self.stats["discovered"] += 1
             return True
+
+        def _guess_common_paths(self, base_url):
+            for path in HUNTER_GUESS_PATHS:
+                candidate = urljoin(base_url, path)
+                if self._is_internal(candidate):
+                    self._enqueue(candidate, depth=1)
 
         def _next_url_round_robin(self, keys, cursor):
             n = len(keys)
@@ -273,21 +398,22 @@ if HAS_HUNTER:
                 q = self.per_domain_queue.get(key)
                 if q:
                     while q:
-                        url = q.popleft()
+                        url, depth = q.popleft()
                         if url not in self.visited:
-                            return key, url
-            return None, None
+                            return key, url, depth
+            return None, None, 0
 
         def crawl(self):
             self.start_time = time.time()
 
             for u in self.start_urls:
-                self._enqueue(u)
+                self._enqueue(u, depth=0)
             for u in self.start_urls:
                 for sm in self._discover_sitemaps(u):
                     for s in self._parse_sitemap(sm):
                         if self._is_internal(s):
-                            self._enqueue(s)
+                            self._enqueue(s, depth=1)
+                self._guess_common_paths(u)
 
             keys = list(self.per_domain_queue.keys())
             if not keys:
@@ -301,14 +427,21 @@ if HAS_HUNTER:
 
             while time.time() < overall_deadline:
                 if all(domain_time_used[k] >= per_domain_budget for k in keys):
-                    break
-                key, url = self._next_url_round_robin(keys, cursor)
+                    remaining = sum(len(self.per_domain_queue.get(k, [])) for k in keys)
+                    if remaining == 0:
+                        break
+                    for k in keys:
+                        if self.per_domain_queue.get(k):
+                            per_domain_budget = HUNTER_MAX_TIME
+                            break
+
+                key, url, depth = self._next_url_round_robin(keys, cursor)
                 cursor += 1
                 if url is None:
                     break
 
                 if domain_time_used.get(key, 0) >= per_domain_budget:
-                    self.per_domain_queue.setdefault(key, _deque_h()).appendleft(url)
+                    self.per_domain_queue.setdefault(key, _deque_h()).appendleft((url, depth))
                     continue
 
                 if url in self.visited:
@@ -339,16 +472,17 @@ if HAS_HUNTER:
                     continue
 
                 for a in soup.find_all("a", href=True):
-                    href = a["href"]
+                    href = str(a["href"])
                     if href.lower().startswith("mailto:"):
                         e = href[7:].split("?")[0].strip().lower()
                         if _is_valid_email(e):
                             self.emails.add(e)
                             self.domain_email_set.setdefault(key, set()).add(e)
 
-                for link in self._extract_links(soup, url):
-                    if link not in self.visited:
-                        self._enqueue(link)
+                if depth < HUNTER_MAX_DEPTH:
+                    for link in self._extract_links(soup, url):
+                        if link not in self.visited:
+                            self._enqueue(link, depth=depth + 1)
 
             self.stats["emails"] = len(self.emails)
             self.stats["time_taken"] = round(time.time() - self.start_time, 2)
@@ -736,7 +870,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
         <circle cx="44" cy="44" r="7" fill="#ffffff"/>
         <path d="M41 44l2 2 4-4" stroke="#0d9488" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
-      <div><b>Email journeys</b><span>CLOUD LIGHT · V5</span></div>
+      <div><b>Email journeys</b><span>CLOUD LIGHT · V6</span></div>
     </div>
     <nav class="nav">
       <button id="nav-home" onclick="showPage('home')">Home</button>
@@ -753,7 +887,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
   <section id="home" class="page active">
     <div class="home-wrap">
       <div class="hero-left">
-        <span class="status-chip"><span class="dot"></span>SYSTEM ONLINE · V5</span>
+        <span class="status-chip"><span class="dot"></span>SYSTEM ONLINE · V6</span>
         <h1 class="hero-title">
           The email ops
           <span class="line-2">command center.</span>
@@ -780,7 +914,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
             <div class="term-line"><span class="term-prompt">→</span><span class="term-out cyan">encoder</span><span class="term-out">q1 · q2 · q3 · b64 ready</span></div>
             <div class="term-line"><span class="term-prompt">→</span><span class="term-out lime">generators</span><span class="term-out">strings · words · names</span></div>
             <div class="term-line"><span class="term-prompt">→</span><span class="term-out magenta">blocklist</span><span class="term-out">zen · barracuda · dbl</span></div>
-            <div class="term-line"><span class="term-prompt">→</span><span class="term-out cyan">hunter</span><span class="term-out">multi-domain crawl</span></div>
+            <div class="term-line"><span class="term-prompt">→</span><span class="term-out cyan">hunter</span><span class="term-out">deep multi-domain crawl</span></div>
             <div class="term-line"><span class="term-prompt">$</span><span class="term-out">status</span></div>
             <div class="term-line"><span class="term-prompt">✓</span><span class="term-out lime">all systems operational</span><span class="term-cursor"></span></div>
           </div>
@@ -830,9 +964,9 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
       </div>
       <div class="feat f-cyan wide" onclick="showPage('hunter')">
         <div class="feat-inner">
-          <span class="feat-tag">05 / HUNT · MULTI-DOMAIN</span>
-          <h3>Email Hunter — Recursive Multi-Site Crawler</h3>
-          <p>Enter <strong>one or many website URLs</strong> (one per line). The hunter crawls all of them within a shared 2-minute budget, extracts every publicly available email (plain, <code>mailto:</code>, and obfuscated like <code>name [at] example [dot] com</code>), removes duplicates, groups results by domain, and returns full crawl statistics. Sitemap-aware, contact-page prioritization, no login bypass — public content only.</p>
+          <span class="feat-tag">05 / HUNT · DEEP CRAWLER</span>
+          <h3>Email Hunter — Multi-Site Deep Crawler</h3>
+          <p>Enter <strong>one or many website URLs</strong> (one per line). The hunter crawls 6 levels deep — following every anchor, footer link, menu link, data attribute, and inline JS URL — plus automatically tries common paths like <code>/kontakt</code>, <code>/impressum</code>, <code>/about</code>, <code>/team</code>. Extracts plain, <code>mailto:</code>, and obfuscated emails. Groups results by domain. Public content only.</p>
           <span class="feat-btn">Open Email Hunter <span class="arrow">→</span></span>
         </div>
       </div>
@@ -1006,8 +1140,8 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
   <section id="hunter" class="page">
     <div class="section-head">
       <div>
-        <h2>Email <span class="accent">Hunter</span> — Multi-Domain</h2>
-        <p>Enter one or many website URLs (one per line). All domains are crawled with the same algorithm within a shared 2-minute budget, results are de-duplicated and grouped by domain.</p>
+        <h2>Email <span class="accent">Hunter</span> — Deep Multi-Domain</h2>
+        <p>Enter one or many website URLs (one per line). The crawler goes 6 levels deep, follows every link in menus, footers, cards, and inline JS, plus auto-tries common contact/about paths. Shared 2-minute budget, results grouped by domain.</p>
       </div>
     </div>
 
@@ -1016,7 +1150,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
       <textarea id="hunter-urls" spellcheck="false" placeholder="https://example.com&#10;https://another-site.com&#10;bistum-augsburg.de"></textarea>
       <div class="hunter-meta">
         <span>Detected domains: <b id="hunter-count-domains">0</b></span>
-        <span>Total budget: <b>120s</b> shared</span>
+        <span>Total budget: <b>120s</b> shared · depth: <b>6</b> levels</span>
       </div>
       <div class="actions" style="margin-top:14px">
         <button class="primary" id="hunter-btn" onclick="startEmailHunter()">Start Crawl</button>
@@ -1054,9 +1188,6 @@ const $ = (id) => document.getElementById(id);
 const PAGES = ['home', 'converter', 'generator', 'blocklist', 'hunter'];
 const state = { blAbort: null, blData: null };
 
-/* ============================================================
-   THEME TOGGLE (light ↔ night)
-   ============================================================ */
 const THEME_KEY = 'ej_theme';
 function applyTheme(theme) {
   const isDark = theme === 'dark';
@@ -1075,9 +1206,6 @@ function toggleTheme() {
   applyTheme(saved);
 })();
 
-/* ============================================================
-   Session — 1 hour
-   ============================================================ */
 const SESSION_MAX_AGE_MS = 60 * 60 * 1000;
 const SESSION_START_KEY = 'ej_session_start';
 const SESSION_BANNER_DELAY_MS = 55 * 60 * 1000;
@@ -1119,9 +1247,6 @@ setInterval(function () {
   updateSessionBanner();
 }, 1000);
 
-/* ============================================================
-   Navigation
-   ============================================================ */
 function showPage(name) {
   if (!checkSession()) return;
   PAGES.forEach((p) => $(p).classList.toggle('active', p === name));
@@ -1149,9 +1274,6 @@ function logoutUser() {
   window.location.href = '/logout';
 }
 
-/* ============================================================
-   Toasts + clipboard
-   ============================================================ */
 function toast(message, kind) {
   const el = document.createElement('div');
   el.className = 'toast ' + (kind || '');
@@ -1208,9 +1330,6 @@ function clearDecode() {
   $('detected').textContent = '';
 }
 
-/* ============================================================
-   API helper
-   ============================================================ */
 async function api(url, opts) {
   const res = await fetch(url, opts);
   if (res.status === 401) {
@@ -1229,9 +1348,6 @@ async function api(url, opts) {
   return data;
 }
 
-/* ============================================================
-   Converter
-   ============================================================ */
 async function encodeText() {
   const text = $('enc-input').value;
   if (!text) {
@@ -1270,9 +1386,6 @@ async function decodeText() {
   }
 }
 
-/* ============================================================
-   Generators
-   ============================================================ */
 function readRange(a, b) {
   let x = Math.max(1, Math.min(parseInt($(a).value, 10) || 1, 10000));
   let y = Math.max(1, Math.min(parseInt($(b).value, 10) || 20, 10000));
@@ -1317,9 +1430,6 @@ async function generateNames() {
   } catch (e) { $('nameStatus').textContent = e.message; toast(e.message, 'err'); }
 }
 
-/* ============================================================
-   Blocklist
-   ============================================================ */
 function esc(v) {
   return String(v === null || v === undefined ? '' : v).replace(/[&<>"']/g, function (c) {
     return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
@@ -1474,9 +1584,6 @@ function exportBlocklistCsv() {
   toast('CSV exported', 'ok');
 }
 
-/* ============================================================
-   Email Hunter — multi-URL
-   ============================================================ */
 const hunterState = { abort: null, sid: null, pollTimer: null, data: null };
 
 function parseHunterUrls() {
@@ -1625,9 +1732,13 @@ function displayHunterResults(d) {
     host.innerHTML = '';
   }
 
-  $('hunter-status').textContent = 'Done — found ' + emails.length + ' unique email' +
+  let statusMsg = 'Done — found ' + emails.length + ' unique email' +
     (emails.length === 1 ? '' : 's') + ' across ' + (s.sites || 0) + ' site' +
     ((s.sites || 0) === 1 ? '' : 's') + ' in ' + (s.time_taken || 0) + 's.';
+  if (s.last_error && !emails.length) {
+    statusMsg += ' Last error: ' + s.last_error;
+  }
+  $('hunter-status').textContent = statusMsg;
 }
 function finishHunterUi() {
   const btn = $('hunter-btn');
@@ -1662,9 +1773,6 @@ function exportHunterCsv() {
   toast('CSV exported', 'ok');
 }
 
-/* ============================================================
-   Boot
-   ============================================================ */
 $('year').textContent = new Date().getFullYear();
 showPage('home');
 
