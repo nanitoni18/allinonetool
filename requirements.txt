@@ -1,6 +1,8 @@
-Flask
-gunicorn
-werkzeug
-dnspython
-requests
-beautifulsoup4
+Flask==3.0.3
+Werkzeug==3.0.3
+requests==2.32.3
+beautifulsoup4==4.12.3
+dnspython==2.6.1
+cloudscraper==1.2.71
+urllib3==2.2.2
+gunicorn==22.0.0
