@@ -33,7 +33,6 @@ try:
 except ImportError:
     HAS_CLOUDSCRAPER = False
 
-# Selenium disabled for Render free tier (heavy, causes build/deploy issues)
 HAS_SELENIUM = False
 
 app = Flask(__name__)
@@ -54,7 +53,6 @@ LOGIN_PASSWORD_HASH = generate_password_hash(os.environ.get("LOGIN_PASSWORD", "a
 
 
 def _log(msg):
-    """Force-flush print so Render captures hunter activity in real time."""
     try:
         print(msg, flush=True)
     except Exception:
@@ -77,9 +75,6 @@ def _handle_any_error(e):
     return "Internal Server Error", 500
 
 
-# ============================================================
-# Health check (Render ku vendaam)
-# ============================================================
 @app.route("/healthz")
 def healthz():
     return "ok", 200
@@ -835,7 +830,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
         <path d="M32 5 55 18v28L32 59 9 46V18z" fill="none" stroke="url(#lg)" stroke-width="3.5" stroke-linejoin="round"/>
         <text x="32" y="40" text-anchor="middle" font-family="Space Grotesk,sans-serif" font-size="19" font-weight="700" fill="url(#lg)">EJ</text>
       </svg>
-      <div><b>Email journeys</b><span>NEON NEXUS · V8</span></div>
+      <div><b>Email journeys</b><span>NEON NEXUS · V9</span></div>
     </div>
     <nav class="nav">
       <button id="nav-home" onclick="showPage('home')">Home</button>
@@ -856,7 +851,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
           <span class="line-1">The email ops</span>
           <span class="line-2">command center.</span>
         </h1>
-        <p class="hero-desc">Encode subject lines, forge identities, audit sending IPs, hunt down publicly available addresses, and filter emails by <code>DMARC</code> posture.</p>
+        <p class="hero-desc">Encode subject lines, forge identities, audit sending IPs, hunt down publicly available addresses, and filter emails by <code>DMARC</code> posture (p= and sp=).</p>
         <div class="hero-actions">
           <button class="primary" onclick="showPage('hunter')">Run Email Hunter</button>
           <button class="secondary" onclick="showPage('dmarc')">Check DMARC</button>
@@ -867,7 +862,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
           <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><b>~ email-journeys --live</b></div>
           <div class="term-body">
             <div class="term-line"><span class="term-prompt">$</span><span class="term-out">hunter crawl --deep --subdomains</span></div>
-            <div class="term-line"><span class="term-prompt">$</span><span class="term-out">dmarc check --bulk --filter=none</span></div>
+            <div class="term-line"><span class="term-prompt">$</span><span class="term-out">dmarc check --p --sp --filter=none</span></div>
             <div class="term-line"><span class="term-prompt">→</span><span class="term-out cyan">requests + cloudscraper</span></div>
             <div class="term-line"><span class="term-prompt">→</span><span class="term-out lime">mail · contact · info · support subs</span></div>
             <div class="term-line"><span class="term-prompt">→</span><span class="term-out magenta">mailto · obfuscated · HTML entities</span></div>
@@ -879,7 +874,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
     <div class="quick-stats">
       <div class="qs-card"><span class="qs-num">3</span><span class="qs-lbl">Q Encoders</span></div>
       <div class="qs-card"><span class="qs-num">4</span><span class="qs-lbl">DNSBL Zones</span></div>
-      <div class="qs-card"><span class="qs-num">11</span><span class="qs-lbl">DMARC Tags</span></div>
+      <div class="qs-card"><span class="qs-num">p+sp</span><span class="qs-lbl">DMARC Policies</span></div>
       <div class="qs-card"><span class="qs-num">7d</span><span class="qs-lbl">Session</span></div>
     </div>
     <div class="feature-grid">
@@ -915,9 +910,9 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
       </div>
       <div class="feat f-magenta wide" onclick="showPage('dmarc')">
         <div class="feat-glow"></div><div class="feat-inner">
-        <span class="feat-tag">06 / AUDIT · DNS TXT · RFC 7489</span>
-        <h3>DMARC Lookup — Single &amp; Bulk</h3>
-        <p>Query <code>_dmarc.&lt;domain&gt;</code> for one domain, or paste thousands of emails and get back <b>only the ones whose domain has no DMARC record</b>. Duplicates removed automatically. Uses dnspython — no API key, no rate limits.</p></div>
+        <span class="feat-tag">06 / AUDIT · DNS TXT · RFC 7489 · p= &amp; sp=</span>
+        <h3>DMARC Lookup — Single &amp; Bulk (p=/sp= aware)</h3>
+        <p>Query <code>_dmarc.&lt;domain&gt;</code> for one domain, or paste thousands of emails and get back <b>only the ones whose domain policy (p=) or subdomain policy (sp=) is "none"</b>. Duplicates removed automatically. Uses dnspython — no API key, no rate limits.</p></div>
       </div>
     </div>
   </section>
@@ -1091,7 +1086,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
     <div class="section-head">
       <div>
         <h2>DMARC <span class="accent">Lookup</span></h2>
-        <p>Single domain record-a paakalaam, illa bulk email list kuduthu — <b>DMARC illadha domain emails mattum</b> filter pannalaam. Duplicates automatic-a remove aagum.</p>
+        <p>Single domain record-a paakalaam, illa bulk email list kuduthu — <b>p= illa sp= la edhuvudhu "none"</b> irukkura domain emails mattum filter pannalaam. Duplicates automatic-a remove aagum.</p>
       </div>
     </div>
 
@@ -1151,7 +1146,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
       <div class="card">
         <label class="label" for="dmarc-emails">Email list (one per line)</label>
         <textarea id="dmarc-emails" placeholder="buybooks@substack.com&#10;info@pralinenbote.de&#10;..." style="min-height:200px"></textarea>
-        <p class="helper" style="margin-top:8px">Duplicates automatic-a remove aagum. DMARC record <b>illaadha</b> domain emails mattum output la varum.</p>
+        <p class="helper" style="margin-top:8px">Duplicates automatic-a remove aagum. <b>p= illa sp= la edhuvudhu "none"</b> irukkura domain emails mattum output la varum. (sp= absent na adhu p=-a inherit pannum.)</p>
         <div class="actions">
           <button class="primary" id="dmarc-bulk-btn" onclick="runDmarcBulk()">Filter Emails</button>
           <button class="secondary" onclick="document.getElementById('dmarc-emails').value=''">Clear</button>
@@ -1165,7 +1160,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
       <div id="dmarc-bulk-summary" class="bl-summary hidden" style="margin-top:20px;grid-template-columns:repeat(4,1fr)"></div>
 
       <div class="card" id="dmarc-bulk-emails-card" style="margin-top:20px;display:none">
-        <h3>Emails without DMARC (<span id="dmarc-bulk-count">0</span>)</h3>
+        <h3>Emails with None policy — p= or sp= (<span id="dmarc-bulk-count">0</span>)</h3>
         <div class="actions" style="margin-top:0;margin-bottom:12px">
           <button class="secondary" onclick="copyBulkNoDmarc(this)">Copy All</button>
           <button class="secondary" onclick="exportBulkNoDmarcCsv()">Export CSV</button>
@@ -1176,12 +1171,14 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
       <div class="card" id="dmarc-bulk-domains-card" style="margin-top:20px;display:none">
         <h3>Per-domain breakdown</h3>
         <div class="bl-table-wrap" style="max-height:520px">
-          <table class="bl-table" style="min-width:820px">
+          <table class="bl-table" style="min-width:960px">
             <thead>
               <tr>
                 <th style="text-align:left">Domain</th>
-                <th>DMARC</th>
+                <th>p=</th>
+                <th>sp=</th>
                 <th>Emails</th>
+                <th>Status</th>
                 <th style="text-align:left">Record</th>
               </tr>
             </thead>
@@ -1203,17 +1200,10 @@ const PAGES = ['home', 'converter', 'generator', 'blocklist', 'hunter', 'dmarc']
 const state = { blAbort: null, blData: null };
 const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const SESSION_START_KEY = 'ej_session_start';
-const SESSION_BANNER_DELAY_MS = 5 * 60 * 1000;
 function sessionStart() {
   sessionStorage.setItem(SESSION_START_KEY, String(Date.now()));
   return Date.now();
 }
-function checkSession() { return true; }
-function updateSessionBanner() {
-  const banner = $('session-banner');
-  banner.classList.remove('show');
-}
-sessionStart();
 function showPage(name) {
   PAGES.forEach((p) => $(p).classList.toggle('active', p === name));
   document.querySelectorAll('.nav button[id^="nav-"]').forEach((b) => b.classList.remove('active'));
@@ -1608,6 +1598,14 @@ function copyDmarcRecord(btn) {
   copyValue(dmarcState.data.record, btn);
 }
 
+function dmarcPolicyPill(policy) {
+  const p = String(policy || 'none').toLowerCase();
+  if (p === 'none') return '<span class="bl-status-pill bl-listed">none</span>';
+  if (p === 'quarantine') return '<span class="bl-status-pill bl-error">quarantine</span>';
+  if (p === 'reject') return '<span class="bl-status-pill bl-ok">reject</span>';
+  return '<span class="bl-status-pill bl-na">' + esc(p) + '</span>';
+}
+
 async function runDmarcBulk() {
   const emails = $('dmarc-emails').value;
   if (!emails.trim()) { toast('Paste emails first', 'err'); return; }
@@ -1625,7 +1623,7 @@ async function runDmarcBulk() {
   const startedAt = Date.now();
   const tick = setInterval(function () {
     const s = ((Date.now() - startedAt) / 1000).toFixed(0);
-    status.textContent = 'Checking DMARC for unique domains… ' + s + 's';
+    status.textContent = 'Checking DMARC (p= & sp=) for unique domains… ' + s + 's';
     bar.style.width = Math.min(90, 15 + Number(s)).toFixed(0) + '%';
   }, 1000);
 
@@ -1642,7 +1640,7 @@ async function runDmarcBulk() {
       ['Total Emails', d.total_emails],
       ['Unique Emails', d.unique_emails],
       ['Unique Domains', d.total_domains],
-      ['No-DMARC', d.no_dmarc_count],
+      ['Weak (p/sp none)', d.no_dmarc_count],
     ];
     $('dmarc-bulk-summary').innerHTML = items.map(function (x) {
       return '<div class="bl-summary-item"><b>' + esc(x[1]) + '</b><span>' + esc(x[0]) + '</span></div>';
@@ -1651,21 +1649,27 @@ async function runDmarcBulk() {
 
     const list = d.no_dmarc_emails || [];
     $('dmarc-bulk-count').textContent = list.length;
-    $('dmarc-bulk-emails').textContent = list.length ? list.join('\n') : 'No emails without DMARC. All domains are protected.';
+    $('dmarc-bulk-emails').textContent = list.length ? list.join('\n') : 'No weak domains. All emails are protected by p= and sp=.';
     $('dmarc-bulk-emails-card').style.display = 'block';
 
     $('dmarc-bulk-tbody').innerHTML = (d.domains || []).map(function (r) {
-      const cls = r.dmarc === 'None' ? 'bl-listed' : 'bl-ok';
+      const spCell = r.sp_explicit
+        ? dmarcPolicyPill(r.sp)
+        : dmarcPolicyPill(r.sp) + ' <span style="font-size:9px;color:var(--muted)">(inherited)</span>';
+      const statusCls = r.weak ? 'bl-listed' : 'bl-ok';
+      const statusTxt = r.weak ? 'INCLUDED' : 'skipped';
       return '<tr>' +
         '<td class="ip-cell">' + esc(r.domain) + '</td>' +
-        '<td><span class="bl-status-pill ' + cls + '">' + esc(r.dmarc) + '</span></td>' +
+        '<td>' + dmarcPolicyPill(r.p) + '</td>' +
+        '<td>' + spCell + '</td>' +
         '<td>' + esc(r.count) + '</td>' +
+        '<td><span class="bl-status-pill ' + statusCls + '">' + statusTxt + '</span></td>' +
         '<td style="text-align:left;font-size:11px;color:var(--muted)">' + esc(r.record || '—') + '</td>' +
         '</tr>';
     }).join('');
     $('dmarc-bulk-domains-card').style.display = 'block';
 
-    status.textContent = 'Done — ' + d.no_dmarc_count + ' email(s) without DMARC across ' +
+    status.textContent = 'Done — ' + d.no_dmarc_count + ' email(s) with p=/sp= none across ' +
                          d.total_domains + ' domain(s) in ' + ((Date.now() - startedAt) / 1000).toFixed(1) + 's.';
     setTimeout(function () { progress.classList.add('hidden'); bar.style.width = '0%'; }, 800);
   } catch (e) {
@@ -1732,7 +1736,6 @@ def auth():
             return jsonify(success=False, error="Session expired"), 401
         return redirect(url_for("login", next=request.path, expired="1"))
 
-    # Sliding window: push the expiry forward on every authenticated request.
     session["login_time"] = time.time()
     session.permanent = True
 
@@ -2224,7 +2227,7 @@ def dbl_status(domain):
 DMARC_TAG_INFO = {
     "v":     ("DMARC1",    "required", "Version. Must be DMARC1.",                          "ok"),
     "p":     ("none",      "required", "Policy for failed messages. none=monitor, quarantine=spam, reject=block.", "ok"),
-    "sp":    ("none",      "optional", "Policy for subdomains without their own DMARC record. Falls back to p= if absent.", "info"),
+    "sp":    ("none",      "optional", "Policy for subdomains without their own DMARC record. Inherits p= if absent.", "info"),
     "pct":   ("100",       "optional", "Percentage of failed messages to apply the policy to (1–100). Default 100.", "info"),
     "rua":   ("",          "optional", "Aggregate report destination(s). Strongly recommended. Up to 2 mailto: URIs, comma-separated.", "warn"),
     "ruf":   ("",          "optional", "Forensic/failure report destination(s). Discouraged for privacy reasons.", "info"),
@@ -2299,6 +2302,14 @@ def _dmarc_health(parsed):
         verdict = "WARN"
     elif p == "quarantine":
         issues.append("p=quarantine sends failed mail to spam — consider upgrading to p=reject for full enforcement.")
+        if verdict == "PASS":
+            verdict = "WARN"
+
+    sp = parsed.get("sp", "").lower()
+    if sp and sp not in ("none", "quarantine", "reject"):
+        issues.append("Invalid sp= tag. Must be none, quarantine, or reject.")
+    elif sp == "none":
+        issues.append("sp=none — subdomains are NOT protected even if p= is strong. Spoofers can use any subdomain.")
         if verdict == "PASS":
             verdict = "WARN"
 
@@ -2387,7 +2398,9 @@ def dmarc_check_api():
 
 @app.post("/api/dmarc/bulk")
 def dmarc_bulk_api():
-    """Input: list of emails. Output: only emails whose domain has NO DMARC record."""
+    """Bulk DMARC filter.
+    Include an email if EITHER its domain's p= OR its effective sp= is 'none'.
+    (If sp= is absent, subdomains inherit p=.)"""
     data = request.get_json(silent=True) or {}
     raw = str(data.get("emails", ""))
 
@@ -2430,7 +2443,28 @@ def dmarc_bulk_api():
     # --- Parallel DMARC lookup per unique domain ---
     def _probe(dom):
         record, err = _dmarc_txt_lookup(dom)
-        return dom, bool(record), record or "", err
+        parsed = _parse_dmarc_record(record) if record else {}
+
+        p_raw = (parsed.get("p", "") or "").strip().lower()
+        sp_raw = (parsed.get("sp", "") or "").strip().lower()
+
+        if not record:
+            eff_p = "none"
+            eff_sp = "none"
+            has_record = False
+            sp_explicit = False
+        else:
+            eff_p = p_raw if p_raw in ("none", "quarantine", "reject") else "none"
+            if sp_raw in ("none", "quarantine", "reject"):
+                eff_sp = sp_raw
+                sp_explicit = True
+            else:
+                # sp= absent or invalid → inherits p=
+                eff_sp = eff_p
+                sp_explicit = False
+            has_record = True
+
+        return dom, has_record, record or "", err, eff_p, eff_sp, sp_explicit
 
     dmarc_map = {}
     with ThreadPoolExecutor(max_workers=min(DMARC_BULK_WORKERS, max(1, len(domain_to_emails)))) as ex:
@@ -2438,10 +2472,16 @@ def dmarc_bulk_api():
         for fut in as_completed(futures):
             dom = futures[fut]
             try:
-                _, found, rec, err = fut.result()
-                dmarc_map[dom] = {"found": found, "record": rec, "error": err}
+                _, has, rec, err, eff_p, eff_sp, sp_explicit = fut.result()
+                dmarc_map[dom] = {
+                    "has_record": has, "record": rec, "error": err,
+                    "p": eff_p, "sp": eff_sp, "sp_explicit": sp_explicit,
+                }
             except Exception as exc:
-                dmarc_map[dom] = {"found": False, "record": "", "error": str(exc)}
+                dmarc_map[dom] = {
+                    "has_record": False, "record": "", "error": str(exc),
+                    "p": "none", "sp": "none", "sp_explicit": False,
+                }
 
     # --- Split ---
     no_dmarc_emails = []
@@ -2449,21 +2489,30 @@ def dmarc_bulk_api():
     domain_rows = []
     for dom, ems in domain_to_emails.items():
         info = dmarc_map.get(dom, {})
-        has = bool(info.get("found"))
-        if has:
-            protected_emails.extend(ems)
-        else:
+        eff_p = info.get("p", "none")
+        eff_sp = info.get("sp", "none")
+
+        # Weak if EITHER domain policy OR subdomain policy is "none"
+        is_weak = (eff_p == "none") or (eff_sp == "none")
+
+        if is_weak:
             no_dmarc_emails.extend(ems)
+        else:
+            protected_emails.extend(ems)
+
         domain_rows.append({
             "domain": dom,
-            "dmarc": "Present" if has else "None",
+            "p": eff_p,
+            "sp": eff_sp,
+            "sp_explicit": bool(info.get("sp_explicit", False)),
             "record": info.get("record", ""),
             "count": len(ems),
+            "weak": is_weak,
         })
 
     no_dmarc_emails.sort()
     protected_emails.sort()
-    domain_rows.sort(key=lambda x: (x["dmarc"] != "None", x["domain"]))
+    domain_rows.sort(key=lambda x: (not x["weak"], x["domain"]))
 
     return jsonify(
         total_emails=len(emails),
