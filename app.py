@@ -1,7 +1,7 @@
 # ============================================================
 # Email journeys — Single-file Flask App (Neon Nexus Edition)
-# Includes: Converter, Generators, Blocklist, Email Hunter
-# Session: 1 hour  |  Theme: Neon Nexus  |  Deep-crawl Hunter + Subdomains
+# Includes: Converter, Generators, Blocklist, Email Hunter, DMARC Lookup
+# Session: 7 days | Theme: Neon Nexus | Deep-crawl Hunter + Subdomains
 # ============================================================
 from flask import Flask, request, jsonify, session, redirect, url_for, Response
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -41,12 +41,13 @@ app.secret_key = os.environ.get("SECRET_KEY", "CHANGE_THIS_TO_A_LONG_RANDOM_SECR
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=False,
-    PERMANENT_SESSION_LIFETIME=timedelta(hours=1),
-    SESSION_REFRESH_EACH_REQUEST=False,
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_NAME="ej_session",
+    PERMANENT_SESSION_LIFETIME=timedelta(days=7),
+    SESSION_REFRESH_EACH_REQUEST=True,
 )
 
-SESSION_MAX_AGE = 60 * 60
+SESSION_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
 
 LOGIN_USERNAME = os.environ.get("LOGIN_USERNAME", "admin")
 LOGIN_PASSWORD_HASH = generate_password_hash(os.environ.get("LOGIN_PASSWORD", "admin"))
@@ -396,7 +397,6 @@ if HAS_HUNTER:
                 "DNT": "1",
             }
 
-            # 1) Plain requests (SSL verify off)
             try:
                 r = self.session.get(url, headers=headers, timeout=HUNTER_TIMEOUT,
                                      allow_redirects=True, verify=False)
@@ -419,7 +419,6 @@ if HAS_HUNTER:
             except Exception as e:
                 _log(f"[HUNTER REQ-ERR] {url} :: {type(e).__name__}: {e}")
 
-            # 2) cloudscraper (Cloudflare)
             if self.scraper is not None:
                 try:
                     r = self.scraper.get(url, headers=headers, timeout=HUNTER_TIMEOUT,
@@ -617,7 +616,6 @@ if HAS_HUNTER:
                 new_links = self._extract_links(soup, url)
                 self._enqueue_many(new_links)
 
-            # --- DEBUG SUMMARY ---
             _log("=" * 60)
             _log(f"[HUNTER SUMMARY] domain={self.base_domain}")
             _log(f"  pages_visited   = {self.stats['pages_visited']}")
@@ -819,8 +817,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
 .session-banner.show{display:block;animation:toastIn .3s ease}
 .session-banner b{background:linear-gradient(100deg,var(--cyan),var(--magenta));-webkit-background-clip:text;background-clip:text;color:transparent}
 .subs-list{margin-top:14px;padding:14px;border:1px dashed var(--line-strong);border-radius:12px;background:var(--panel-2);font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--text-soft);max-height:180px;overflow:auto;white-space:pre-wrap}
-@media(max-width:980px){.home-wrap{grid-template-columns:1fr}.feature-grid{grid-template-columns:1fr 1fr}.feat,.feat.wide{grid-column:span 1}.feat.wide{grid-column:span 2}.quick-stats{grid-template-columns:repeat(2,1fr)}.workspace,.controls3{grid-template-columns:1fr}.bl-form{grid-template-columns:1fr}.bl-summary{grid-template-columns:repeat(3,1fr)}}
-@media(max-width:640px){.app{padding:14px 14px 0}.topbar{position:static}.nav{width:100%}.nav button{flex:1 1 auto}.feature-grid{grid-template-columns:1fr}.feat,.feat.wide{grid-column:auto}.quick-stats{grid-template-columns:repeat(2,1fr)}.bl-summary{grid-template-columns:repeat(2,1fr)}.output-wrap{flex-direction:column}.copy-btn{padding:11px;width:100%}}
+@media(max-width:980px){.home-wrap{grid-template-columns:1fr}.feature-grid{grid-template-columns:1fr 1fr}.feat,.feat.wide{grid-column:span 1}.feat.wide{grid-column:span 2}.quick-stats{grid-template-columns:repeat(2,1fr)}.workspace,.controls3{grid-template-columns:1fr}.bl-form{grid-template-columns:1fr}.bl-summary{grid-template-columns:repeat(3,1fr)}}@media(max-width:640px){.app{padding:14px 14px 0}.topbar{position:static}.nav{width:100%}.nav button{flex:1 1 auto}.feature-grid{grid-template-columns:1fr}.feat,.feat.wide{grid-column:auto}.quick-stats{grid-template-columns:repeat(2,1fr)}.bl-summary{grid-template-columns:repeat(2,1fr)}.output-wrap{flex-direction:column}.copy-btn{padding:11px;width:100%}}
 </style>
 </head>
 <body>
@@ -836,9 +833,9 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
           <stop stop-color="#00e5ff"/><stop offset=".5" stop-color="#b8ff2b"/><stop offset="1" stop-color="#ff2d95"/>
         </linearGradient></defs>
         <path d="M32 5 55 18v28L32 59 9 46V18z" fill="none" stroke="url(#lg)" stroke-width="3.5" stroke-linejoin="round"/>
-        <text x="32" y="40" text-anchor="middle" font-family="Space Grotesk,sans-serif" font-size="19" font-weight="700" fill="url(#lg)">{U}</text>
+        <text x="32" y="40" text-anchor="middle" font-family="Space Grotesk,sans-serif" font-size="19" font-weight="700" fill="url(#lg)">EJ</text>
       </svg>
-      <div><b>Email journeys</b><span>NEON NEXUS · V7</span></div>
+      <div><b>Email journeys</b><span>NEON NEXUS · V8</span></div>
     </div>
     <nav class="nav">
       <button id="nav-home" onclick="showPage('home')">Home</button>
@@ -846,6 +843,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
       <button id="nav-generator" onclick="showPage('generator')">Generators</button>
       <button id="nav-blocklist" onclick="showPage('blocklist')">Blocklist</button>
       <button id="nav-hunter" onclick="showPage('hunter')">Email Hunter</button>
+      <button id="nav-dmarc" onclick="showPage('dmarc')">DMARC</button>
       <button class="icon-btn" id="theme-btn" onclick="toggleTheme()" title="Toggle theme">☀</button>
       <button class="logout" onclick="logoutUser()">Logout</button>
     </nav>
@@ -858,10 +856,10 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
           <span class="line-1">The email ops</span>
           <span class="line-2">command center.</span>
         </h1>
-        <p class="hero-desc">Encode subject lines, forge identities, audit sending IPs, and hunt down publicly available addresses — including across <code>subdomains</code>.</p>
+        <p class="hero-desc">Encode subject lines, forge identities, audit sending IPs, hunt down publicly available addresses, and filter emails by <code>DMARC</code> posture.</p>
         <div class="hero-actions">
           <button class="primary" onclick="showPage('hunter')">Run Email Hunter</button>
-          <button class="secondary" onclick="showPage('converter');setMode('encode')">Launch Converter</button>
+          <button class="secondary" onclick="showPage('dmarc')">Check DMARC</button>
         </div>
       </div>
       <div class="hero-right">
@@ -869,6 +867,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
           <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><b>~ email-journeys --live</b></div>
           <div class="term-body">
             <div class="term-line"><span class="term-prompt">$</span><span class="term-out">hunter crawl --deep --subdomains</span></div>
+            <div class="term-line"><span class="term-prompt">$</span><span class="term-out">dmarc check --bulk --filter=none</span></div>
             <div class="term-line"><span class="term-prompt">→</span><span class="term-out cyan">requests + cloudscraper</span></div>
             <div class="term-line"><span class="term-prompt">→</span><span class="term-out lime">mail · contact · info · support subs</span></div>
             <div class="term-line"><span class="term-prompt">→</span><span class="term-out magenta">mailto · obfuscated · HTML entities</span></div>
@@ -880,8 +879,8 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
     <div class="quick-stats">
       <div class="qs-card"><span class="qs-num">3</span><span class="qs-lbl">Q Encoders</span></div>
       <div class="qs-card"><span class="qs-num">4</span><span class="qs-lbl">DNSBL Zones</span></div>
-      <div class="qs-card"><span class="qs-num">240s</span><span class="qs-lbl">Hunt Window</span></div>
-      <div class="qs-card"><span class="qs-num">60m</span><span class="qs-lbl">Session</span></div>
+      <div class="qs-card"><span class="qs-num">11</span><span class="qs-lbl">DMARC Tags</span></div>
+      <div class="qs-card"><span class="qs-num">7d</span><span class="qs-lbl">Session</span></div>
     </div>
     <div class="feature-grid">
       <div class="feat f-cyan" onclick="showPage('converter');setMode('encode')">
@@ -913,6 +912,12 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
         <span class="feat-tag">05 / HUNT · DEEP CRAWL · SUBDOMAINS</span>
         <h3>Email Hunter — Multi-layer Crawler</h3>
         <p>Requests + cloudscraper. Discovers and crawls subdomains via DNS wordlist and crt.sh. Extracts plain, mailto, obfuscated, and HTML-entity emails. Public content only.</p></div>
+      </div>
+      <div class="feat f-magenta wide" onclick="showPage('dmarc')">
+        <div class="feat-glow"></div><div class="feat-inner">
+        <span class="feat-tag">06 / AUDIT · DNS TXT · RFC 7489</span>
+        <h3>DMARC Lookup — Single &amp; Bulk</h3>
+        <p>Query <code>_dmarc.&lt;domain&gt;</code> for one domain, or paste thousands of emails and get back <b>only the ones whose domain has no DMARC record</b>. Duplicates removed automatically. Uses dnspython — no API key, no rate limits.</p></div>
       </div>
     </div>
   </section>
@@ -1082,6 +1087,111 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
     </div>
   </section>
 
+  <section id="dmarc" class="page">
+    <div class="section-head">
+      <div>
+        <h2>DMARC <span class="accent">Lookup</span></h2>
+        <p>Single domain record-a paakalaam, illa bulk email list kuduthu — <b>DMARC illadha domain emails mattum</b> filter pannalaam. Duplicates automatic-a remove aagum.</p>
+      </div>
+    </div>
+
+    <div class="tabs">
+      <button id="dmarc-single-tab" class="tab active" onclick="dmarcTab('single')">Single Domain</button>
+      <button id="dmarc-bulk-tab" class="tab" onclick="dmarcTab('bulk')">Bulk Email Filter</button>
+    </div>
+
+    <div id="dmarc-single-panel">
+      <div class="card">
+        <label class="label" for="dmarc-domain">Domain</label>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <input id="dmarc-domain" type="text" placeholder="example.com" autocomplete="off" spellcheck="false" style="flex:1;min-width:240px">
+          <button class="primary" id="dmarc-btn" onclick="runDmarcCheck()">Check DMARC</button>
+          <button class="secondary" onclick="cancelDmarc()">Cancel</button>
+        </div>
+        <div id="dmarc-status" class="status" style="margin-top:14px"></div>
+        <div id="dmarc-health" class="bl-health"></div>
+      </div>
+
+      <div id="dmarc-result-card" style="display:none">
+        <div class="card" style="margin-top:20px">
+          <h3>Verdict</h3>
+          <div id="dmarc-verdict" style="margin-bottom:12px"></div>
+          <div id="dmarc-issues" style="color:var(--text-soft);font-size:13px;line-height:1.8"></div>
+        </div>
+
+        <div class="card" style="margin-top:20px">
+          <h3>Raw Record</h3>
+          <div class="actions" style="margin-top:0;margin-bottom:12px">
+            <button class="secondary" onclick="copyDmarcRecord(this)">Copy Raw Record</button>
+          </div>
+          <div id="dmarc-raw" class="output" style="min-height:56px;max-height:200px;overflow:auto"></div>
+        </div>
+
+        <div class="card" style="margin-top:20px">
+          <h3>Parsed Tags</h3>
+          <div class="bl-table-wrap" style="max-height:520px">
+            <table class="bl-table" style="min-width:820px">
+              <thead>
+                <tr>
+                  <th style="text-align:left">Tag</th>
+                  <th>Value</th>
+                  <th>Required</th>
+                  <th>Default</th>
+                  <th style="text-align:left">Meaning</th>
+                </tr>
+              </thead>
+              <tbody id="dmarc-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="dmarc-bulk-panel" class="hidden">
+      <div class="card">
+        <label class="label" for="dmarc-emails">Email list (one per line)</label>
+        <textarea id="dmarc-emails" placeholder="buybooks@substack.com&#10;info@pralinenbote.de&#10;..." style="min-height:200px"></textarea>
+        <p class="helper" style="margin-top:8px">Duplicates automatic-a remove aagum. DMARC record <b>illaadha</b> domain emails mattum output la varum.</p>
+        <div class="actions">
+          <button class="primary" id="dmarc-bulk-btn" onclick="runDmarcBulk()">Filter Emails</button>
+          <button class="secondary" onclick="document.getElementById('dmarc-emails').value=''">Clear</button>
+        </div>
+        <div id="dmarc-bulk-status" class="status" style="margin-top:12px"></div>
+        <div class="bl-progress hidden" id="dmarc-bulk-progress" style="margin-top:10px">
+          <div class="bl-progress-bar" id="dmarc-bulk-bar" style="width:10%"></div>
+        </div>
+      </div>
+
+      <div id="dmarc-bulk-summary" class="bl-summary hidden" style="margin-top:20px;grid-template-columns:repeat(4,1fr)"></div>
+
+      <div class="card" id="dmarc-bulk-emails-card" style="margin-top:20px;display:none">
+        <h3>Emails without DMARC (<span id="dmarc-bulk-count">0</span>)</h3>
+        <div class="actions" style="margin-top:0;margin-bottom:12px">
+          <button class="secondary" onclick="copyBulkNoDmarc(this)">Copy All</button>
+          <button class="secondary" onclick="exportBulkNoDmarcCsv()">Export CSV</button>
+        </div>
+        <div id="dmarc-bulk-emails" class="output" style="min-height:100px;max-height:520px;overflow:auto"></div>
+      </div>
+
+      <div class="card" id="dmarc-bulk-domains-card" style="margin-top:20px;display:none">
+        <h3>Per-domain breakdown</h3>
+        <div class="bl-table-wrap" style="max-height:520px">
+          <table class="bl-table" style="min-width:820px">
+            <thead>
+              <tr>
+                <th style="text-align:left">Domain</th>
+                <th>DMARC</th>
+                <th>Emails</th>
+                <th style="text-align:left">Record</th>
+              </tr>
+            </thead>
+            <tbody id="dmarc-bulk-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <div class="footer">Email journeys · <span class="grad">Neon Nexus</span> · <span id="year"></span></div>
 </div>
 
@@ -1089,41 +1199,28 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
 
 <script>
 const $ = (id) => document.getElementById(id);
-const PAGES = ['home', 'converter', 'generator', 'blocklist', 'hunter'];
+const PAGES = ['home', 'converter', 'generator', 'blocklist', 'hunter', 'dmarc'];
 const state = { blAbort: null, blData: null };
-const SESSION_MAX_AGE_MS = 60 * 60 * 1000;
+const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const SESSION_START_KEY = 'ej_session_start';
-const SESSION_BANNER_DELAY_MS = 55 * 60 * 1000;
+const SESSION_BANNER_DELAY_MS = 5 * 60 * 1000;
 function sessionStart() {
-  let t = parseInt(sessionStorage.getItem(SESSION_START_KEY) || '0', 10);
-  if (!t || Date.now() - t > SESSION_MAX_AGE_MS) { t = Date.now(); sessionStorage.setItem(SESSION_START_KEY, String(t)); }
-  return t;
+  sessionStorage.setItem(SESSION_START_KEY, String(Date.now()));
+  return Date.now();
 }
-function checkSession() {
-  const elapsed = Date.now() - sessionStart();
-  if (elapsed >= SESSION_MAX_AGE_MS) { sessionStorage.removeItem(SESSION_START_KEY); window.location.href = '/login?expired=1'; return false; }
-  return true;
-}
+function checkSession() { return true; }
 function updateSessionBanner() {
-  const banner = $('session-banner'), label = $('session-countdown');
-  const elapsed = Date.now() - sessionStart();
-  const remaining = Math.max(0, SESSION_MAX_AGE_MS - elapsed);
-  if (remaining <= SESSION_MAX_AGE_MS - SESSION_BANNER_DELAY_MS && remaining > 0) {
-    const m = String(Math.floor(remaining / 60000)).padStart(2, '0');
-    const s = String(Math.floor((remaining % 60000) / 1000)).padStart(2, '0');
-    label.textContent = m + ':' + s;
-    banner.classList.add('show');
-  } else banner.classList.remove('show');
+  const banner = $('session-banner');
+  banner.classList.remove('show');
 }
 sessionStart();
-setInterval(function () { if (checkSession()) updateSessionBanner(); }, 1000);
 function showPage(name) {
-  if (!checkSession()) return;
   PAGES.forEach((p) => $(p).classList.toggle('active', p === name));
   document.querySelectorAll('.nav button[id^="nav-"]').forEach((b) => b.classList.remove('active'));
   const btn = $('nav-' + name); if (btn) btn.classList.add('active');
   window.scrollTo({ top: 0, behavior: 'smooth' });
   if (name === 'blocklist') refreshHealth();
+  if (name === 'dmarc') refreshDmarcHealth();
 }
 function setMode(mode) {
   showPage('converter');
@@ -1137,6 +1234,12 @@ function genTab(mode) {
     $('gen-' + x).classList.toggle('hidden', x !== mode);
     $('gen-' + x + '-tab').classList.toggle('active', x === mode);
   });
+}
+function dmarcTab(which) {
+  $('dmarc-single-panel').classList.toggle('hidden', which !== 'single');
+  $('dmarc-bulk-panel').classList.toggle('hidden', which !== 'bulk');
+  $('dmarc-single-tab').classList.toggle('active', which === 'single');
+  $('dmarc-bulk-tab').classList.toggle('active', which === 'bulk');
 }
 function toggleTheme() {
   const light = document.body.classList.toggle('light');
@@ -1182,7 +1285,7 @@ function clearArea(id) { $(id).value = ''; }
 function clearDecode() { $('dec-input').value = ''; $('dec-output').textContent = ''; $('detected').textContent = ''; }
 async function api(url, opts) {
   const res = await fetch(url, opts);
-  if (res.status === 401) { sessionStorage.removeItem(SESSION_START_KEY); window.location.href = '/login?expired=1'; throw new Error('Session expired'); }
+  if (res.status === 401) { window.location.href = '/login?expired=1'; throw new Error('Session expired'); }
   const text = await res.text();
   let data;
   try { data = text ? JSON.parse(text) : {}; } catch (e) { throw new Error('Non-JSON (HTTP ' + res.status + ')'); }
@@ -1408,6 +1511,188 @@ function exportHunterCsv() {
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   URL.revokeObjectURL(url); toast('CSV exported', 'ok');
 }
+
+/* ---------------- DMARC Lookup ---------------- */
+const dmarcState = { abort: null, data: null };
+const dmarcBulkState = { data: null };
+
+async function refreshDmarcHealth() {
+  try {
+    const d = await api('/api/dmarc/health', { method: 'GET' });
+    const color = d.ok ? 'var(--ok)' : 'var(--danger)';
+    $('dmarc-health').innerHTML =
+      'Resolver: <b>' + esc((d.nameservers || []).join(', ') || 'system') + '</b>' +
+      ' · dnspython: <b>' + (d.dnspython ? 'OK' : 'MISSING') + '</b>' +
+      ' · <span style="color:' + color + '">' + (d.ok ? 'Ready' : 'Not ready') + '</span>';
+  } catch (e) {
+    $('dmarc-health').textContent = 'Health check failed: ' + e.message;
+  }
+}
+
+async function runDmarcCheck() {
+  const domain = $('dmarc-domain').value.trim();
+  if (!domain) { toast('Enter a domain first', 'err'); return; }
+  const btn = $('dmarc-btn');
+  const status = $('dmarc-status');
+  const card = $('dmarc-result-card');
+  const banner = $('dmarc-verdict');
+  const issuesEl = $('dmarc-issues');
+  const raw = $('dmarc-raw');
+  const tbody = $('dmarc-tbody');
+
+  dmarcState.abort = new AbortController();
+  btn.disabled = true; btn.textContent = 'Checking…';
+  status.textContent = 'Looking up _dmarc.' + domain + ' …';
+  card.style.display = 'none';
+
+  try {
+    const d = await api('/api/dmarc/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ domain: domain }),
+      signal: dmarcState.abort.signal,
+    });
+    dmarcState.data = d;
+
+    const v = d.verdict || 'FAIL';
+    const cls = v === 'PASS' ? 'bl-ok' : v === 'WARN' ? 'bl-error' : 'bl-listed';
+    banner.innerHTML = '<span class="bl-status-pill ' + cls + '">' + esc(v) + '</span>' +
+      '<span style="margin-left:10px;color:var(--text-soft)">' + esc(d.domain) + '</span>';
+
+    if (d.issues && d.issues.length) {
+      issuesEl.innerHTML = d.issues.map(function (i) { return '<div>• ' + esc(i) + '</div>'; }).join('');
+    } else {
+      issuesEl.textContent = '';
+    }
+
+    raw.textContent = d.record || (d.error || 'No DMARC record found.');
+
+    tbody.innerHTML = (d.tags || []).map(function (t) {
+      const vCls = t.present ? 'bl-ok' : (t.required === 'required' ? 'bl-listed' : 'bl-na');
+      const vLabel = t.present ? esc(t.value || '(empty)') : 'MISSING';
+      return '<tr>' +
+        '<td class="ip-cell"><b>' + esc(t.tag) + '</b></td>' +
+        '<td><span class="bl-status-pill ' + vCls + '">' + vLabel + '</span></td>' +
+        '<td>' + esc(t.required) + '</td>' +
+        '<td>' + esc(t.default) + '</td>' +
+        '<td style="text-align:left">' + esc(t.description) + '</td>' +
+        '</tr>';
+    }).join('');
+
+    card.style.display = 'block';
+    if (d.found) {
+      status.textContent = 'Record found for ' + d.domain + '. Verdict: ' + d.verdict + '.';
+    } else {
+      status.textContent = 'No DMARC record published for ' + d.domain + '.';
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') status.textContent = 'Cancelled.';
+    else { status.textContent = e.message; toast(e.message, 'err'); }
+    card.style.display = 'none';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Check DMARC';
+    dmarcState.abort = null;
+  }
+}
+
+function cancelDmarc() {
+  if (dmarcState.abort) dmarcState.abort.abort();
+  $('dmarc-btn').disabled = false;
+  $('dmarc-btn').textContent = 'Check DMARC';
+  $('dmarc-status').textContent = 'Cancelled.';
+  setTimeout(function () { $('dmarc-result-card').style.display = 'none'; }, 400);
+}
+
+function copyDmarcRecord(btn) {
+  if (!dmarcState.data || !dmarcState.data.record) { toast('Nothing to copy', 'err'); return; }
+  copyValue(dmarcState.data.record, btn);
+}
+
+async function runDmarcBulk() {
+  const emails = $('dmarc-emails').value;
+  if (!emails.trim()) { toast('Paste emails first', 'err'); return; }
+  const btn = $('dmarc-bulk-btn');
+  const status = $('dmarc-bulk-status');
+  const progress = $('dmarc-bulk-progress');
+  const bar = $('dmarc-bulk-bar');
+
+  btn.disabled = true; btn.textContent = 'Checking…';
+  progress.classList.remove('hidden'); bar.style.width = '15%';
+  $('dmarc-bulk-summary').classList.add('hidden');
+  $('dmarc-bulk-emails-card').style.display = 'none';
+  $('dmarc-bulk-domains-card').style.display = 'none';
+
+  const startedAt = Date.now();
+  const tick = setInterval(function () {
+    const s = ((Date.now() - startedAt) / 1000).toFixed(0);
+    status.textContent = 'Checking DMARC for unique domains… ' + s + 's';
+    bar.style.width = Math.min(90, 15 + Number(s)).toFixed(0) + '%';
+  }, 1000);
+
+  try {
+    const d = await api('/api/dmarc/bulk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ emails: emails }),
+    });
+    dmarcBulkState.data = d;
+    clearInterval(tick); bar.style.width = '100%';
+
+    const items = [
+      ['Total Emails', d.total_emails],
+      ['Unique Emails', d.unique_emails],
+      ['Unique Domains', d.total_domains],
+      ['No-DMARC', d.no_dmarc_count],
+    ];
+    $('dmarc-bulk-summary').innerHTML = items.map(function (x) {
+      return '<div class="bl-summary-item"><b>' + esc(x[1]) + '</b><span>' + esc(x[0]) + '</span></div>';
+    }).join('');
+    $('dmarc-bulk-summary').classList.remove('hidden');
+
+    const list = d.no_dmarc_emails || [];
+    $('dmarc-bulk-count').textContent = list.length;
+    $('dmarc-bulk-emails').textContent = list.length ? list.join('\n') : 'No emails without DMARC. All domains are protected.';
+    $('dmarc-bulk-emails-card').style.display = 'block';
+
+    $('dmarc-bulk-tbody').innerHTML = (d.domains || []).map(function (r) {
+      const cls = r.dmarc === 'None' ? 'bl-listed' : 'bl-ok';
+      return '<tr>' +
+        '<td class="ip-cell">' + esc(r.domain) + '</td>' +
+        '<td><span class="bl-status-pill ' + cls + '">' + esc(r.dmarc) + '</span></td>' +
+        '<td>' + esc(r.count) + '</td>' +
+        '<td style="text-align:left;font-size:11px;color:var(--muted)">' + esc(r.record || '—') + '</td>' +
+        '</tr>';
+    }).join('');
+    $('dmarc-bulk-domains-card').style.display = 'block';
+
+    status.textContent = 'Done — ' + d.no_dmarc_count + ' email(s) without DMARC across ' +
+                         d.total_domains + ' domain(s) in ' + ((Date.now() - startedAt) / 1000).toFixed(1) + 's.';
+    setTimeout(function () { progress.classList.add('hidden'); bar.style.width = '0%'; }, 800);
+  } catch (e) {
+    clearInterval(tick);
+    progress.classList.add('hidden'); bar.style.width = '0%';
+    status.textContent = e.message;
+    toast(e.message, 'err');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Filter Emails';
+  }
+}
+
+async function copyBulkNoDmarc(btn) {
+  if (!dmarcBulkState.data || !dmarcBulkState.data.no_dmarc_emails) { toast('Nothing to copy', 'err'); return; }
+  await copyValue(dmarcBulkState.data.no_dmarc_emails.join('\n'), btn);
+}
+
+function exportBulkNoDmarcCsv() {
+  if (!dmarcBulkState.data || !dmarcBulkState.data.no_dmarc_emails) { toast('Nothing to export', 'err'); return; }
+  const lines = ['email'].concat(dmarcBulkState.data.no_dmarc_emails);
+  const blob = new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob); const a = document.createElement('a');
+  a.href = url; a.download = 'no-dmarc-emails.csv';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url); toast('CSV exported', 'ok');
+}
+
 $('year').textContent = new Date().getFullYear();
 showPage('home');
 document.addEventListener('keydown', function (e) {
@@ -1416,6 +1701,7 @@ document.addEventListener('keydown', function (e) {
     if (active && active.id === 'enc-input') encodeText();
     if (active && active.id === 'dec-input') decodeText();
     if (active && active.id === 'hunter-url') startEmailHunter();
+    if (active && active.id === 'dmarc-domain') runDmarcCheck();
   }
 });
 </script>
@@ -1440,11 +1726,15 @@ def auth():
         return redirect(url_for("login", next=request.path))
 
     login_time = session.get("login_time", 0)
-    if time.time() - login_time > SESSION_MAX_AGE:
+    if not login_time or (time.time() - login_time) > SESSION_MAX_AGE:
         session.clear()
         if request.path.startswith("/api/"):
             return jsonify(success=False, error="Session expired"), 401
         return redirect(url_for("login", next=request.path, expired="1"))
+
+    # Sliding window: push the expiry forward on every authenticated request.
+    session["login_time"] = time.time()
+    session.permanent = True
 
 
 LOGIN_HTML = '''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Sign in • Email journeys</title>
@@ -1512,7 +1802,7 @@ def home():
     if not session.get("logged_in"):
         return redirect(url_for("login"))
     login_time = session.get("login_time", 0)
-    if time.time() - login_time > SESSION_MAX_AGE:
+    if not login_time or (time.time() - login_time) > SESSION_MAX_AGE:
         session.clear()
         return redirect(url_for("login", expired="1"))
     return Response(INDEX_HTML, mimetype="text/html")
@@ -1521,8 +1811,8 @@ def home():
 # ============================================================
 # SVG assets
 # ============================================================
-LOGO_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#07080f"/><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#00e5ff"/><stop offset=".5" stop-color="#b8ff2b"/><stop offset="1" stop-color="#ff2d95"/></linearGradient></defs><path d="M32 6 55 19v26L32 58 9 45V19z" fill="none" stroke="url(#g)" stroke-width="3.5" stroke-linejoin="round"/><text x="32" y="40" text-anchor="middle" font-family="Space Grotesk,sans-serif" font-size="19" font-weight="700" fill="url(#g)">{U}</text></svg>'
-BIMI_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><title>Email journeys</title><rect width="100" height="100" fill="#07080f"/><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#00e5ff"/><stop offset=".5" stop-color="#b8ff2b"/><stop offset="1" stop-color="#ff2d95"/></linearGradient></defs><path d="M50 10 86 31v38L50 90 14 69V31z" fill="none" stroke="url(#g)" stroke-width="4" stroke-linejoin="round"/><text x="50" y="60" text-anchor="middle" font-family="Space Grotesk,sans-serif" font-size="26" font-weight="700" fill="url(#g)">{U}</text></svg>'
+LOGO_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#07080f"/><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#00e5ff"/><stop offset=".5" stop-color="#b8ff2b"/><stop offset="1" stop-color="#ff2d95"/></linearGradient></defs><path d="M32 6 55 19v26L32 58 9 45V19z" fill="none" stroke="url(#g)" stroke-width="3.5" stroke-linejoin="round"/><text x="32" y="40" text-anchor="middle" font-family="Space Grotesk,sans-serif" font-size="19" font-weight="700" fill="url(#g)">EJ</text></svg>'
+BIMI_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><title>Email journeys</title><rect width="100" height="100" fill="#07080f"/><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#00e5ff"/><stop offset=".5" stop-color="#b8ff2b"/><stop offset="1" stop-color="#ff2d95"/></linearGradient></defs><path d="M50 10 86 31v38L50 90 14 69V31z" fill="none" stroke="url(#g)" stroke-width="4" stroke-linejoin="round"/><text x="50" y="60" text-anchor="middle" font-family="Space Grotesk,sans-serif" font-size="26" font-weight="700" fill="url(#g)">EJ</text></svg>'
 
 
 @app.route("/favicon.svg")
@@ -1926,6 +2216,265 @@ def dbl_status(domain):
         if a.startswith("127."):
             return "LISTED"
     return "N/A"
+
+
+# ============================================================
+# DMARC Lookup
+# ============================================================
+DMARC_TAG_INFO = {
+    "v":     ("DMARC1",    "required", "Version. Must be DMARC1.",                          "ok"),
+    "p":     ("none",      "required", "Policy for failed messages. none=monitor, quarantine=spam, reject=block.", "ok"),
+    "sp":    ("none",      "optional", "Policy for subdomains without their own DMARC record. Falls back to p= if absent.", "info"),
+    "pct":   ("100",       "optional", "Percentage of failed messages to apply the policy to (1–100). Default 100.", "info"),
+    "rua":   ("",          "optional", "Aggregate report destination(s). Strongly recommended. Up to 2 mailto: URIs, comma-separated.", "warn"),
+    "ruf":   ("",          "optional", "Forensic/failure report destination(s). Discouraged for privacy reasons.", "info"),
+    "adkim": ("r",         "optional", "DKIM alignment: r=relaxed (default, recommended), s=strict.", "info"),
+    "aspf":  ("r",         "optional", "SPF alignment: r=relaxed (default, recommended), s=strict.", "info"),
+    "fo":    ("0",         "optional", "Failure reporting options for ruf: 0, 1, d, s.",       "info"),
+    "rf":    ("afrf",      "optional", "Report format for ruf.",                              "info"),
+    "ri":    ("86400",     "optional", "Aggregate report interval in seconds. Default 86400 (24h).", "info"),
+}
+DMARC_KNOWN_TAGS = set(DMARC_TAG_INFO.keys())
+
+DMARC_BULK_WORKERS = int(os.environ.get("DMARC_BULK_WORKERS", "24"))
+DMARC_BULK_MAX_EMAILS = int(os.environ.get("DMARC_BULK_MAX_EMAILS", "5000"))
+
+
+def _dmarc_txt_lookup(domain):
+    """Fetch the raw _dmarc.<domain> TXT record. Returns (record_string, error)."""
+    if not HAS_DNSPYTHON:
+        return None, "dnspython is not installed on the server."
+    if not _DNS_RESOLVER:
+        return None, "DNS resolver is not available."
+    query = "_dmarc." + domain.strip().lower().rstrip(".")
+    try:
+        answers = _DNS_RESOLVER.resolve(query, "TXT", raise_on_no_answer=False,
+                                        lifetime=DNS_LIFETIME)
+    except Exception as exc:
+        return None, "DNS lookup failed: " + type(exc).__name__
+    rrset = getattr(answers, "rrset", None)
+    if not rrset:
+        return None, "No DMARC record found at " + query
+    for rdata in rrset:
+        try:
+            txt = b"".join(rdata.strings).decode("utf-8", errors="replace")
+        except Exception:
+            txt = str(rdata)
+        if txt.strip().upper().startswith("V=DMARC1"):
+            return txt.strip(), None
+    return None, "A TXT record exists at " + query + " but it is not a DMARC record."
+
+
+def _parse_dmarc_record(record):
+    """Parse 'v=DMARC1; p=reject; rua=...' into an ordered dict."""
+    parsed = {}
+    if not record:
+        return parsed
+    for part in record.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        key, _, val = part.partition("=")
+        parsed[key.strip().lower()] = val.strip()
+    return parsed
+
+
+def _dmarc_health(parsed):
+    """Return (verdict, issues_list). verdict is 'PASS', 'WARN', or 'FAIL'."""
+    issues = []
+    verdict = "PASS"
+
+    if not parsed:
+        return "FAIL", ["No DMARC record published."]
+
+    if parsed.get("v", "").upper() != "DMARC1":
+        return "FAIL", ["Invalid version tag. DMARC record must start with v=DMARC1."]
+
+    p = parsed.get("p", "").lower()
+    if p not in ("none", "quarantine", "reject"):
+        return "FAIL", ["Missing or invalid p= tag. Must be none, quarantine, or reject."]
+
+    if p == "none":
+        issues.append("p=none is monitor-only — spoofed mail is NOT blocked. Move to quarantine or reject once reports look clean.")
+        verdict = "WARN"
+    elif p == "quarantine":
+        issues.append("p=quarantine sends failed mail to spam — consider upgrading to p=reject for full enforcement.")
+        if verdict == "PASS":
+            verdict = "WARN"
+
+    if not parsed.get("rua"):
+        issues.append("No rua= tag — you are not receiving aggregate reports. Add rua=mailto:dmarc@yourdomain.com")
+        if verdict == "PASS":
+            verdict = "WARN"
+
+    pct = parsed.get("pct")
+    if pct is not None:
+        try:
+            pct_int = int(pct)
+            if pct_int < 100:
+                issues.append("pct=" + str(pct_int) + " — only that percentage of failed mail gets the policy. Set pct=100 for full enforcement.")
+                if verdict == "PASS":
+                    verdict = "WARN"
+        except ValueError:
+            issues.append("pct= must be an integer between 1 and 100.")
+            if verdict == "PASS":
+                verdict = "WARN"
+
+    unknown = [k for k in parsed if k not in DMARC_KNOWN_TAGS]
+    if unknown:
+        issues.append("Unknown tag(s): " + ", ".join(unknown) + " — may be ignored by receivers.")
+
+    if not issues:
+        issues.append("Record looks healthy. Policy is enforced and reports are configured.")
+
+    return verdict, issues
+
+
+@app.get("/api/dmarc/health")
+def dmarc_health():
+    return jsonify(
+        dnspython=HAS_DNSPYTHON,
+        resolver_configured=bool(_DNS_RESOLVER),
+        nameservers=RESOLVER_NAMESERVERS,
+        ok=HAS_DNSPYTHON and bool(_DNS_RESOLVER),
+    )
+
+
+@app.post("/api/dmarc/check")
+def dmarc_check_api():
+    data = request.get_json(silent=True) or {}
+    raw = str(data.get("domain", "")).strip().lower()
+    if not raw:
+        return jsonify(error="Enter a domain name."), 400
+
+    if "://" in raw:
+        raw = raw.split("://", 1)[1]
+    raw = raw.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    raw = raw.rstrip(".")
+
+    if not raw or "." not in raw or " " in raw:
+        return jsonify(error="That doesn't look like a valid domain."), 400
+
+    record, err = _dmarc_txt_lookup(raw)
+    parsed = _parse_dmarc_record(record) if record else {}
+    verdict, issues = _dmarc_health(parsed)
+
+    rows = []
+    for tag, (default, required, desc, sev) in DMARC_TAG_INFO.items():
+        present = tag in parsed
+        rows.append({
+            "tag": tag,
+            "value": parsed.get(tag, ""),
+            "present": present,
+            "required": required,
+            "default": default,
+            "description": desc,
+            "severity": sev,
+        })
+
+    return jsonify(
+        domain=raw,
+        query="_dmarc." + raw,
+        found=bool(record),
+        record=record or "",
+        error=err if not record else None,
+        tags=rows,
+        verdict=verdict,
+        issues=issues,
+        nameservers=RESOLVER_NAMESERVERS,
+    )
+
+
+@app.post("/api/dmarc/bulk")
+def dmarc_bulk_api():
+    """Input: list of emails. Output: only emails whose domain has NO DMARC record."""
+    data = request.get_json(silent=True) or {}
+    raw = str(data.get("emails", ""))
+
+    if not raw.strip():
+        return jsonify(error="Paste at least one email address."), 400
+
+    # --- Parse + dedupe emails ---
+    seen = set()
+    emails = []
+    for chunk in raw.replace(",", "\n").replace(";", "\n").splitlines():
+        token = chunk.strip().lower()
+        if not token or "@" not in token:
+            continue
+        token = token.split()[0]
+        if not _is_valid_email(token):
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        emails.append(token)
+
+    if not emails:
+        return jsonify(error="No valid email addresses found."), 400
+    if len(emails) > DMARC_BULK_MAX_EMAILS:
+        return jsonify(error="Maximum " + str(DMARC_BULK_MAX_EMAILS) +
+                       " emails per check. You pasted " + str(len(emails)) + "."), 400
+
+    # --- Unique domains ---
+    domain_to_emails = {}
+    for e in emails:
+        local, _, dom = e.partition("@")
+        dom = dom.strip().rstrip(".")
+        if not dom or "." not in dom:
+            continue
+        domain_to_emails.setdefault(dom, []).append(e)
+
+    if not domain_to_emails:
+        return jsonify(error="No valid domains found in the email list."), 400
+
+    # --- Parallel DMARC lookup per unique domain ---
+    def _probe(dom):
+        record, err = _dmarc_txt_lookup(dom)
+        return dom, bool(record), record or "", err
+
+    dmarc_map = {}
+    with ThreadPoolExecutor(max_workers=min(DMARC_BULK_WORKERS, max(1, len(domain_to_emails)))) as ex:
+        futures = {ex.submit(_probe, d): d for d in domain_to_emails}
+        for fut in as_completed(futures):
+            dom = futures[fut]
+            try:
+                _, found, rec, err = fut.result()
+                dmarc_map[dom] = {"found": found, "record": rec, "error": err}
+            except Exception as exc:
+                dmarc_map[dom] = {"found": False, "record": "", "error": str(exc)}
+
+    # --- Split ---
+    no_dmarc_emails = []
+    protected_emails = []
+    domain_rows = []
+    for dom, ems in domain_to_emails.items():
+        info = dmarc_map.get(dom, {})
+        has = bool(info.get("found"))
+        if has:
+            protected_emails.extend(ems)
+        else:
+            no_dmarc_emails.extend(ems)
+        domain_rows.append({
+            "domain": dom,
+            "dmarc": "Present" if has else "None",
+            "record": info.get("record", ""),
+            "count": len(ems),
+        })
+
+    no_dmarc_emails.sort()
+    protected_emails.sort()
+    domain_rows.sort(key=lambda x: (x["dmarc"] != "None", x["domain"]))
+
+    return jsonify(
+        total_emails=len(emails),
+        unique_emails=len(seen),
+        total_domains=len(domain_to_emails),
+        no_dmarc_count=len(no_dmarc_emails),
+        protected_count=len(protected_emails),
+        no_dmarc_emails=no_dmarc_emails,
+        domains=domain_rows,
+        nameservers=RESOLVER_NAMESERVERS,
+    )
 
 
 def check_blocklist_ip(ip):
