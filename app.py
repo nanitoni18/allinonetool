@@ -8,7 +8,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.exceptions import HTTPException
 from email.header import decode_header
 from datetime import timedelta
-import base64, random, string, secrets, socket, ipaddress, os, threading, time, sys
+import base64, random, string, secrets, socket, ipaddress, os, threading, time, sys, gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -75,12 +75,14 @@ def healthz():
 
 
 # ============================================================
-# Email Hunter — deep crawler (nav/footer priority, 404-friendly)
+# Email Hunter — memory-safe, nav-priority, 404-tolerant
 # ============================================================
 if HAS_HUNTER:
-    HUNTER_MAX_TIME = 240
-    HUNTER_TIMEOUT = 20
-    HUNTER_MAX_HOST_FAILURES = 5
+    HUNTER_MAX_TIME = 150
+    HUNTER_TIMEOUT = 12
+    HUNTER_MAX_HOST_FAILURES = 3
+    HUNTER_MAX_HTML_BYTES = 2 * 1024 * 1024   # 2 MB cap per page
+    HUNTER_MAX_QUEUE = 80                     # queue size cap
 
     HUNTER_UAS = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -394,6 +396,36 @@ if HAS_HUNTER:
 
             return links
 
+        def _read_capped(self, resp, url):
+            """Streaming read with size cap. Returns text or None."""
+            try:
+                cl = resp.headers.get("Content-Length")
+                if cl:
+                    try:
+                        if int(cl) > HUNTER_MAX_HTML_BYTES:
+                            _log(f"[HUNTER SKIP-BIG] {cl} bytes {url}")
+                            return None
+                    except Exception:
+                        pass
+                chunks = []
+                total = 0
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > HUNTER_MAX_HTML_BYTES:
+                        _log(f"[HUNTER SKIP-BIG-STREAM] >{HUNTER_MAX_HTML_BYTES} {url}")
+                        return None
+                    chunks.append(chunk)
+                raw = b"".join(chunks)
+                enc = resp.encoding or "utf-8"
+                if enc.lower() in ("iso-8859-1", "ascii"):
+                    enc = "utf-8"
+                return raw.decode(enc, errors="replace")
+            except Exception as e:
+                _log(f"[HUNTER READ-ERR] {url} :: {e}")
+                return None
+
         def _fetch(self, url):
             if not self._is_valid_url(url):
                 return None
@@ -414,29 +446,37 @@ if HAS_HUNTER:
                 "DNT": "1",
             }
 
+            # 1) plain requests
             try:
                 r = self.session.get(url, headers=headers, timeout=HUNTER_TIMEOUT,
-                                     allow_redirects=True, verify=False)
+                                     allow_redirects=True, verify=False, stream=True)
                 self.stats["status_codes"][str(r.status_code)] = \
                     self.stats["status_codes"].get(str(r.status_code), 0) + 1
                 ctype = (r.headers.get("Content-Type") or "").lower()
 
-                if r.status_code in (200, 404) and r.text:
+                if r.status_code in (200, 404):
                     if ctype and not any(t in ctype for t in (
                             "text/html", "text/plain", "application/xhtml",
                             "application/xml", "text/xml")):
                         _log(f"[HUNTER SKIP-CTYPE] {ctype[:40]} {url}")
+                        try: r.close()
+                        except Exception: pass
                         return None
-                    if r.encoding and r.encoding.lower() in ("iso-8859-1", "ascii"):
-                        r.encoding = r.apparent_encoding or "utf-8"
-                    if r.status_code == 200:
-                        self.host_failures.pop(host, None)
-                    _log(f"[HUNTER OK-{r.status_code}] len={len(r.text)} {url}")
-                    return r.text
+                    text = self._read_capped(r, url)
+                    try: r.close()
+                    except Exception: pass
+                    if text:
+                        if r.status_code == 200:
+                            self.host_failures.pop(host, None)
+                        _log(f"[HUNTER OK-{r.status_code}] len={len(text)} {url}")
+                        return text
+                    return None
 
                 if r.status_code >= 400 and r.status_code != 404:
                     self.host_failures[host] = self.host_failures.get(host, 0) + 1
                 _log(f"[HUNTER STATUS] {r.status_code} {url}")
+                try: r.close()
+                except Exception: pass
 
             except requests.exceptions.Timeout:
                 self.host_failures[host] = self.host_failures.get(host, 0) + 1
@@ -451,22 +491,27 @@ if HAS_HUNTER:
                 self.host_failures[host] = self.host_failures.get(host, 0) + 1
                 _log(f"[HUNTER REQ-ERR] {url} :: {type(e).__name__}: {e}")
 
+            # 2) cloudscraper
             if self.scraper is not None:
                 try:
                     r = self.scraper.get(url, headers=headers, timeout=HUNTER_TIMEOUT,
-                                         allow_redirects=True)
+                                         allow_redirects=True, stream=True)
                     ctype = (r.headers.get("Content-Type") or "").lower()
-                    if r.status_code in (200, 404) and r.text:
+                    if r.status_code in (200, 404):
                         if ctype and not any(t in ctype for t in (
                                 "text/html", "text/plain", "application/xhtml",
                                 "application/xml", "text/xml")):
+                            try: r.close()
+                            except Exception: pass
                             return None
-                        if r.encoding and r.encoding.lower() in ("iso-8859-1", "ascii"):
-                            r.encoding = r.apparent_encoding or "utf-8"
-                        if r.status_code == 200:
-                            self.host_failures.pop(host, None)
-                        _log(f"[HUNTER OK-CS-{r.status_code}] len={len(r.text)} {url}")
-                        return r.text
+                        text = self._read_capped(r, url)
+                        try: r.close()
+                        except Exception: pass
+                        if text:
+                            if r.status_code == 200:
+                                self.host_failures.pop(host, None)
+                            _log(f"[HUNTER OK-CS-{r.status_code}] len={len(text)} {url}")
+                            return text
                 except Exception as e:
                     _log(f"[HUNTER CS-ERR] {url} :: {type(e).__name__}: {e}")
 
@@ -497,28 +542,43 @@ if HAS_HUNTER:
                 return urls
             try:
                 r = self.session.get(sm_url, headers={"User-Agent": self._ua()},
-                                     timeout=8, verify=False)
+                                     timeout=8, verify=False, stream=True)
                 if r.status_code != 200:
+                    try: r.close()
+                    except Exception: pass
                     return urls
-                soup = BeautifulSoup(r.text, "xml")
+                text = self._read_capped(r, sm_url) or ""
+                try: r.close()
+                except Exception: pass
+                if not text:
+                    return urls
+                soup = BeautifulSoup(text, "xml")
                 for sm in soup.find_all("sitemap"):
                     loc = sm.find("loc")
                     if loc and loc.text:
                         urls.update(self._parse_sitemap(loc.text.strip(), depth + 1))
                 for loc in soup.find_all("loc"):
                     urls.add(loc.text.strip())
+                try:
+                    soup.decompose()
+                except Exception:
+                    pass
             except Exception:
                 pass
             return urls
 
         def _enqueue_many(self, urls):
             for u in urls:
+                if len(self.queue) >= HUNTER_MAX_QUEUE:
+                    break
                 if u not in self.visited and u not in self.queue:
                     self.queue.append(u)
                     self.stats["discovered"] += 1
 
         def _enqueue_nav(self, urls):
             for u in urls:
+                if len(self.queue) >= HUNTER_MAX_QUEUE:
+                    break
                 if u not in self.visited and u not in self.queue:
                     self.queue.appendleft(u)
                     self.stats["discovered"] += 1
@@ -530,20 +590,24 @@ if HAS_HUNTER:
             self.email_sources.setdefault(email, set()).add(page_url)
 
         def _process_html(self, html, url, is_start=False):
+            # 1) Extract emails from raw HTML first (before parsing)
             for e in hunter_extract_emails(html):
                 self._record_email(e, url)
 
+            soup = None
             try:
                 soup = BeautifulSoup(html, "html.parser")
             except Exception:
                 return
 
+            # 2) Extract mailto: emails
             for a in soup.find_all("a", href=True):
                 href = str(a["href"])
                 if href.lower().startswith("mailto:"):
                     e = href[7:].split("?")[0].strip().lower()
                     self._record_email(e, url)
 
+            # 3) HIGH priority: nav + footer links
             nav_links = self._extract_nav_footer_links(soup, url)
             if nav_links:
                 self.stats["nav_pages"] = self.stats.get("nav_pages", 0) + 1
@@ -553,8 +617,18 @@ if HAS_HUNTER:
                     self._enqueue_nav(nav_links)
                 _log(f"[HUNTER NAV] {len(nav_links)} nav/footer links on {url}")
 
+            # 4) Medium: everything else
             other_links = self._extract_links(soup, url)
             self._enqueue_many(other_links)
+
+            # 5) Free memory
+            try:
+                soup.decompose()
+            except Exception:
+                pass
+            soup = None
+            del html
+            gc.collect()
 
         def crawl(self):
             self.start_time = time.time()
@@ -562,21 +636,29 @@ if HAS_HUNTER:
             _log(f"[HUNTER START] {self.start_url} (base={self.base_domain})")
             _log("=" * 60)
 
+            # 1) Start page first
             start_html = self._fetch(self.start_url)
             if start_html:
                 self.visited.add(self.start_url)
                 self.stats["visited"] += 1
                 self.stats["pages_visited"] += 1
                 self._process_html(start_html, self.start_url, is_start=True)
+                start_html = None
 
+            # 2) Sitemap
             for sm in self._discover_sitemaps():
                 for u in self._parse_sitemap(sm):
                     if self._is_valid_url(u) and self._is_internal(u) \
                             and u not in self.visited:
+                        if len(self.queue) >= HUNTER_MAX_QUEUE:
+                            break
                         self.queue.append(u)
                         self.stats["discovered"] += 1
 
+            # 3) Guess paths
             for path in HUNTER_GUESS_PATHS:
+                if len(self.queue) >= HUNTER_MAX_QUEUE:
+                    break
                 candidate = urljoin(self.start_url, path)
                 if self._is_valid_url(candidate) and self._is_internal(candidate) \
                         and candidate not in self.visited and candidate not in self.queue:
@@ -585,6 +667,7 @@ if HAS_HUNTER:
 
             _log(f"[HUNTER QUEUE] initial={len(self.queue)}")
 
+            # 4) Main loop
             while self.queue and (time.time() - self.start_time) < HUNTER_MAX_TIME:
                 url = self.queue.popleft()
                 if url in self.visited:
@@ -601,6 +684,7 @@ if HAS_HUNTER:
                     self.stats["contact_pages"] += 1
 
                 self._process_html(html, url, is_start=False)
+                html = None
 
             _log("=" * 60)
             _log(f"[HUNTER SUMMARY] domain={self.base_domain}")
@@ -817,7 +901,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
         <path d="M32 5 55 18v28L32 59 9 46V18z" fill="none" stroke="url(#lg)" stroke-width="3.5" stroke-linejoin="round"/>
         <text x="32" y="40" text-anchor="middle" font-family="Space Grotesk,sans-serif" font-size="19" font-weight="700" fill="url(#lg)">EJ</text>
       </svg>
-      <div><b>Email journeys</b><span>NEON NEXUS · V11</span></div>
+      <div><b>Email journeys</b><span>NEON NEXUS · V12</span></div>
     </div>
     <nav class="nav">
       <button id="nav-home" onclick="showPage('home')">Home</button>
@@ -848,9 +932,9 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
         <div class="terminal">
           <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><b>~ email-journeys --live</b></div>
           <div class="term-body">
-            <div class="term-line"><span class="term-prompt">$</span><span class="term-out">hunter crawl --single --bulk --nav-priority</span></div>
+            <div class="term-line"><span class="term-prompt">$</span><span class="term-out">hunter crawl --single --bulk --memory-safe</span></div>
             <div class="term-line"><span class="term-prompt">$</span><span class="term-out">dmarc check --p --sp --filter=none</span></div>
-            <div class="term-line"><span class="term-prompt">→</span><span class="term-out cyan">requests + cloudscraper</span></div>
+            <div class="term-line"><span class="term-prompt">→</span><span class="term-out cyan">2 MB cap · streaming read</span></div>
             <div class="term-line"><span class="term-prompt">→</span><span class="term-out lime">header · nav · footer first</span></div>
             <div class="term-line"><span class="term-prompt">→</span><span class="term-out magenta">email + domain + source page</span></div>
             <div class="term-line"><span class="term-prompt">✓</span><span class="term-out lime">ready</span><span class="term-cursor"></span></div>
@@ -891,9 +975,9 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
       </div>
       <div class="feat f-cyan wide" onclick="showPage('hunter')">
         <div class="feat-glow"></div><div class="feat-inner">
-        <span class="feat-tag">05 / HUNT · SINGLE · BULK · NAV PRIORITY</span>
-        <h3>Email Hunter — Nav-aware Crawler</h3>
-        <p>Crawls one website or a bulk list. <b>Extracts header/nav/footer links first</b> (Work &amp; Travel, Joburi, Servicii, Despre, …) then crawls those pages for publicly available emails. Each email shows its <b>domain</b> and <b>source page URL(s)</b>. Handles 404 pages gracefully — still grabs nav/footer links from them.</p></div>
+        <span class="feat-tag">05 / HUNT · MEMORY-SAFE · NAV-PRIORITY</span>
+        <h3>Email Hunter — Memory-Safe Crawler</h3>
+        <p>Crawls one website or a bulk list. <b>Streams responses with a 2 MB cap</b>, skips huge pages, and extracts header/nav/footer links first (Work &amp; Travel, Joburi, Servicii, Despre, …). Each email shows its <b>domain</b> and <b>source page URL(s)</b>. Handles 404 pages gracefully.</p></div>
       </div>
       <div class="feat f-magenta wide" onclick="showPage('dmarc')">
         <div class="feat-glow"></div><div class="feat-inner">
@@ -2345,7 +2429,7 @@ DMARC_TAG_INFO = {
 }
 DMARC_KNOWN_TAGS = set(DMARC_TAG_INFO.keys())
 
-DMARC_BULK_WORKERS = int(os.environ.get("DMARC_BULK_WORKERS", "24"))
+DMARC_BULK_WORKERS = int(os.environ.get("DMARC_BULK_WORKERS", "10"))
 DMARC_BULK_MAX_EMAILS = int(os.environ.get("DMARC_BULK_MAX_EMAILS", "5000"))
 
 
@@ -2736,7 +2820,7 @@ def blocklist_check_api():
 
 
 # ============================================================
-# Email Hunter API — single & bulk
+# Email Hunter API — single & bulk, memory-safe
 # ============================================================
 @app.post("/api/email-hunter/start")
 def email_hunter_start():
@@ -2791,6 +2875,7 @@ def email_hunter_start():
             start_t = time.time()
             for u in normalized:
                 _log(f"[HUNTER MULTI] start {u}")
+                crawler = None
                 try:
                     crawler = EmailHunterCrawler(u)
                     res = crawler.crawl()
@@ -2811,6 +2896,22 @@ def email_hunter_start():
                 except Exception as ie:
                     _log(f"[HUNTER MULTI-ERR] {u} :: {ie}")
                     agg["errors"] += 1
+                finally:
+                    if crawler is not None:
+                        try:
+                            crawler.session.close()
+                        except Exception:
+                            pass
+                        try:
+                            crawler.visited.clear()
+                            crawler.queue.clear()
+                            crawler.emails.clear()
+                            crawler.email_sources.clear()
+                            crawler.host_failures.clear()
+                        except Exception:
+                            pass
+                    crawler = None
+                    gc.collect()
 
             agg["emails"] = len(all_emails)
             agg["time_taken"] = round(time.time() - start_t, 2)
