@@ -1,8 +1,7 @@
-Flask
-Werkzeug
+flask
+werkzeug
 requests
 beautifulsoup4
-dnspython
 cloudscraper
-urllib3
+dnspython
 gunicorn
