@@ -1,7 +1,7 @@
 # ============================================================
 # Email journeys — Single-file Flask App (Neon Nexus Edition)
-# Includes: Converter, Generators, Blocklist, Email Hunter, DMARC Lookup
 # Session: 7 days | Theme: Neon Nexus
+# Includes: Converter, Generators, Blocklist, Email Hunter, DMARC Lookup
 # ============================================================
 from flask import Flask, request, jsonify, session, redirect, url_for, Response
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -31,8 +31,6 @@ try:
     HAS_CLOUDSCRAPER = True
 except ImportError:
     HAS_CLOUDSCRAPER = False
-
-HAS_SELENIUM = False
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET_123456789")
@@ -77,13 +75,12 @@ def healthz():
 
 
 # ============================================================
-# Email Hunter — deep crawler (subdomain probing removed)
+# Email Hunter — deep crawler (nav/footer priority, 404-friendly)
 # ============================================================
 if HAS_HUNTER:
     HUNTER_MAX_TIME = 240
     HUNTER_TIMEOUT = 20
-    HUNTER_PER_URL_TIME = 180  # max seconds per URL in bulk mode
-    HUNTER_MAX_HOST_FAILURES = 3
+    HUNTER_MAX_HOST_FAILURES = 5
 
     HUNTER_UAS = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -103,15 +100,32 @@ if HAS_HUNTER:
         "dekanate", "referate", "stellenangebote", "presse", "medien",
         "ueber-uns", "uber-uns", "wir", "despre", "echipa", "contacte",
         "parohie", "parohii", "episcopie", "arhiepiscopie", "preoti",
+        "work-and-travel", "work-travel", "joburi", "job", "cariere",
+        "servicii", "serviciu", "programe", "program", "alte-programe",
+        "viza", "carduri", "bilete", "ambassador", "internship",
     ]
     HUNTER_GUESS_PATHS = [
         "/kontakt", "/impressum", "/uber-uns", "/ueber-uns", "/team",
         "/ansprechpartner", "/mitarbeiter", "/datenschutz", "/personen",
-        "/generalvikariat", "/ordinatiat", "/ordinariat", "/pfarreien",
-        "/dekanate", "/referate", "/stellenangebote", "/presse", "/medien",
+        "/generalvikariat", "/ordinariat", "/pfarreien", "/dekanate",
+        "/referate", "/stellenangebote", "/presse", "/medien",
         "/contact", "/about", "/about-us", "/contact-us", "/imprint",
         "/contacte", "/despre", "/despre-noi", "/echipa",
         "/parohii", "/parohie", "/episcopie", "/preoti", "/clero",
+        "/servicii", "/programe", "/alte-programe", "/joburi",
+        "/work-and-travel-usa", "/work-and-travel", "/viza-sua",
+        "/carduri-de-reduceri", "/bilete-de-avion",
+    ]
+    HUNTER_NAV_SELECTORS = [
+        "header", "nav", "footer",
+        '[role="navigation"]', '[role="banner"]', '[role="contentinfo"]',
+        ".elementor-nav-menu", ".elementor-nav-menu--main",
+        ".elementor-nav-menu--dropdown", ".elementor-location-header",
+        ".elementor-location-footer", ".elementor-widget-nav-menu",
+        ".sub-menu", ".menu-item", ".nav-menu", ".navbar", ".navbar-nav",
+        ".site-navigation", ".main-navigation", ".site-header", ".site-footer",
+        ".nav", ".footer", ".footer-widgets", ".footer-nav",
+        ".widget_nav_menu", ".widget-nav-menu", ".menu",
     ]
 
     _EMAIL_RE = _re_h.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
@@ -204,8 +218,8 @@ if HAS_HUNTER:
             self.visited = set()
             self.queue = _deque_h()
             self.emails = set()
-            self.email_sources = {}   # email -> set(page URLs)
-            self.host_failures = {}   # host -> count
+            self.email_sources = {}
+            self.host_failures = {}
 
             self.session = requests.Session()
             self.scraper = None
@@ -220,6 +234,7 @@ if HAS_HUNTER:
             self.stats = {
                 "pages_visited": 0,
                 "contact_pages": 0,
+                "nav_pages": 0,
                 "errors": 0,
                 "discovered": 0,
                 "visited": 0,
@@ -297,6 +312,30 @@ if HAS_HUNTER:
             path = urlparse(url).path.lower()
             return any(kw in path for kw in HUNTER_CONTACT_KEYWORDS)
 
+        def _extract_nav_footer_links(self, soup, base_url):
+            links = set()
+
+            def _add(candidate):
+                u = self._normalize(base_url, candidate)
+                if u:
+                    links.add(u)
+
+            for tag_name in ("header", "nav", "footer"):
+                for region in soup.find_all(tag_name):
+                    for a in region.find_all("a", href=True):
+                        _add(a.get("href"))
+
+            for sel in HUNTER_NAV_SELECTORS:
+                try:
+                    regions = soup.select(sel)
+                except Exception:
+                    continue
+                for region in regions:
+                    for a in region.find_all("a", href=True):
+                        _add(a.get("href"))
+
+            return links
+
         def _extract_links(self, soup, base_url):
             links = set()
 
@@ -356,7 +395,6 @@ if HAS_HUNTER:
             return links
 
         def _fetch(self, url):
-            # strict pre-flight checks
             if not self._is_valid_url(url):
                 return None
             try:
@@ -370,18 +408,20 @@ if HAS_HUNTER:
             headers = {
                 "User-Agent": self._ua(),
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9,de;q=0.8,fr;q=0.7,ro;q=0.6",
+                "Accept-Language": "en-US,en;q=0.9,ro;q=0.8,de;q=0.7",
                 "Connection": "keep-alive",
                 "Upgrade-Insecure-Requests": "1",
                 "DNT": "1",
             }
 
-            # 1) plain requests
             try:
                 r = self.session.get(url, headers=headers, timeout=HUNTER_TIMEOUT,
                                      allow_redirects=True, verify=False)
+                self.stats["status_codes"][str(r.status_code)] = \
+                    self.stats["status_codes"].get(str(r.status_code), 0) + 1
                 ctype = (r.headers.get("Content-Type") or "").lower()
-                if r.status_code == 200 and r.text:
+
+                if r.status_code in (200, 404) and r.text:
                     if ctype and not any(t in ctype for t in (
                             "text/html", "text/plain", "application/xhtml",
                             "application/xml", "text/xml")):
@@ -389,14 +429,15 @@ if HAS_HUNTER:
                         return None
                     if r.encoding and r.encoding.lower() in ("iso-8859-1", "ascii"):
                         r.encoding = r.apparent_encoding or "utf-8"
-                    self.host_failures.pop(host, None)
-                    _log(f"[HUNTER OK] {r.status_code} len={len(r.text)} {url}")
+                    if r.status_code == 200:
+                        self.host_failures.pop(host, None)
+                    _log(f"[HUNTER OK-{r.status_code}] len={len(r.text)} {url}")
                     return r.text
-                self.stats["status_codes"][str(r.status_code)] = \
-                    self.stats["status_codes"].get(str(r.status_code), 0) + 1
-                if r.status_code >= 400:
+
+                if r.status_code >= 400 and r.status_code != 404:
                     self.host_failures[host] = self.host_failures.get(host, 0) + 1
                 _log(f"[HUNTER STATUS] {r.status_code} {url}")
+
             except requests.exceptions.Timeout:
                 self.host_failures[host] = self.host_failures.get(host, 0) + 1
                 _log(f"[HUNTER TIMEOUT] {url}")
@@ -410,21 +451,21 @@ if HAS_HUNTER:
                 self.host_failures[host] = self.host_failures.get(host, 0) + 1
                 _log(f"[HUNTER REQ-ERR] {url} :: {type(e).__name__}: {e}")
 
-            # 2) cloudscraper
             if self.scraper is not None:
                 try:
                     r = self.scraper.get(url, headers=headers, timeout=HUNTER_TIMEOUT,
                                          allow_redirects=True)
                     ctype = (r.headers.get("Content-Type") or "").lower()
-                    if r.status_code == 200 and r.text:
+                    if r.status_code in (200, 404) and r.text:
                         if ctype and not any(t in ctype for t in (
                                 "text/html", "text/plain", "application/xhtml",
                                 "application/xml", "text/xml")):
                             return None
                         if r.encoding and r.encoding.lower() in ("iso-8859-1", "ascii"):
                             r.encoding = r.apparent_encoding or "utf-8"
-                        self.host_failures.pop(host, None)
-                        _log(f"[HUNTER OK-CS] {r.status_code} len={len(r.text)} {url}")
+                        if r.status_code == 200:
+                            self.host_failures.pop(host, None)
+                        _log(f"[HUNTER OK-CS-{r.status_code}] len={len(r.text)} {url}")
                         return r.text
                 except Exception as e:
                     _log(f"[HUNTER CS-ERR] {url} :: {type(e).__name__}: {e}")
@@ -470,17 +511,16 @@ if HAS_HUNTER:
                 pass
             return urls
 
-        def _prioritize(self):
-            prior, rest = [], []
-            while self.queue:
-                u = self.queue.popleft()
-                (prior if self._is_contact(u) else rest).append(u)
-            self.queue = _deque_h(prior + rest)
-
         def _enqueue_many(self, urls):
             for u in urls:
                 if u not in self.visited and u not in self.queue:
                     self.queue.append(u)
+                    self.stats["discovered"] += 1
+
+        def _enqueue_nav(self, urls):
+            for u in urls:
+                if u not in self.visited and u not in self.queue:
+                    self.queue.appendleft(u)
                     self.stats["discovered"] += 1
 
         def _record_email(self, email, page_url):
@@ -489,29 +529,63 @@ if HAS_HUNTER:
             self.emails.add(email)
             self.email_sources.setdefault(email, set()).add(page_url)
 
+        def _process_html(self, html, url, is_start=False):
+            for e in hunter_extract_emails(html):
+                self._record_email(e, url)
+
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+            except Exception:
+                return
+
+            for a in soup.find_all("a", href=True):
+                href = str(a["href"])
+                if href.lower().startswith("mailto:"):
+                    e = href[7:].split("?")[0].strip().lower()
+                    self._record_email(e, url)
+
+            nav_links = self._extract_nav_footer_links(soup, url)
+            if nav_links:
+                self.stats["nav_pages"] = self.stats.get("nav_pages", 0) + 1
+                if is_start:
+                    self._enqueue_many(nav_links)
+                else:
+                    self._enqueue_nav(nav_links)
+                _log(f"[HUNTER NAV] {len(nav_links)} nav/footer links on {url}")
+
+            other_links = self._extract_links(soup, url)
+            self._enqueue_many(other_links)
+
         def crawl(self):
             self.start_time = time.time()
-            self.queue.append(self.start_url)
-
             _log("=" * 60)
             _log(f"[HUNTER START] {self.start_url} (base={self.base_domain})")
             _log("=" * 60)
 
+            start_html = self._fetch(self.start_url)
+            if start_html:
+                self.visited.add(self.start_url)
+                self.stats["visited"] += 1
+                self.stats["pages_visited"] += 1
+                self._process_html(start_html, self.start_url, is_start=True)
+
             for sm in self._discover_sitemaps():
                 for u in self._parse_sitemap(sm):
-                    if self._is_valid_url(u) and self._is_internal(u) and u not in self.visited:
+                    if self._is_valid_url(u) and self._is_internal(u) \
+                            and u not in self.visited:
                         self.queue.append(u)
                         self.stats["discovered"] += 1
 
             for path in HUNTER_GUESS_PATHS:
                 candidate = urljoin(self.start_url, path)
                 if self._is_valid_url(candidate) and self._is_internal(candidate) \
-                        and candidate not in self.visited:
+                        and candidate not in self.visited and candidate not in self.queue:
                     self.queue.append(candidate)
                     self.stats["discovered"] += 1
 
+            _log(f"[HUNTER QUEUE] initial={len(self.queue)}")
+
             while self.queue and (time.time() - self.start_time) < HUNTER_MAX_TIME:
-                self._prioritize()
                 url = self.queue.popleft()
                 if url in self.visited:
                     continue
@@ -526,30 +600,13 @@ if HAS_HUNTER:
                 if self._is_contact(url):
                     self.stats["contact_pages"] += 1
 
-                # extract emails from raw HTML
-                for e in hunter_extract_emails(html):
-                    self._record_email(e, url)
-
-                try:
-                    soup = BeautifulSoup(html, "html.parser")
-                except Exception:
-                    continue
-
-                # extract mailto links
-                for a in soup.find_all("a", href=True):
-                    href = str(a["href"])
-                    if href.lower().startswith("mailto:"):
-                        e = href[7:].split("?")[0].strip().lower()
-                        self._record_email(e, url)
-
-                # extract new internal links
-                new_links = self._extract_links(soup, url)
-                self._enqueue_many(new_links)
+                self._process_html(html, url, is_start=False)
 
             _log("=" * 60)
             _log(f"[HUNTER SUMMARY] domain={self.base_domain}")
             _log(f"  pages_visited   = {self.stats['pages_visited']}")
             _log(f"  contact_pages   = {self.stats['contact_pages']}")
+            _log(f"  nav_pages       = {self.stats.get('nav_pages', 0)}")
             _log(f"  status_codes    = {self.stats.get('status_codes', {})}")
             _log(f"  errors          = {self.stats['errors']}")
             _log(f"  discovered      = {self.stats['discovered']}")
@@ -760,7 +817,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
         <path d="M32 5 55 18v28L32 59 9 46V18z" fill="none" stroke="url(#lg)" stroke-width="3.5" stroke-linejoin="round"/>
         <text x="32" y="40" text-anchor="middle" font-family="Space Grotesk,sans-serif" font-size="19" font-weight="700" fill="url(#lg)">EJ</text>
       </svg>
-      <div><b>Email journeys</b><span>NEON NEXUS · V10</span></div>
+      <div><b>Email journeys</b><span>NEON NEXUS · V11</span></div>
     </div>
     <nav class="nav">
       <button id="nav-home" onclick="showPage('home')">Home</button>
@@ -781,7 +838,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
           <span class="line-1">The email ops</span>
           <span class="line-2">command center.</span>
         </h1>
-        <p class="hero-desc">Encode subject lines, forge identities, audit sending IPs, hunt publicly available emails across single or bulk URLs, and filter emails by <code>DMARC</code> posture (p= and sp=).</p>
+        <p class="hero-desc">Encode subject lines, forge identities, audit sending IPs, hunt publicly available emails from single or bulk URLs, and filter emails by <code>DMARC</code> posture (p= and sp=).</p>
         <div class="hero-actions">
           <button class="primary" onclick="showPage('hunter')">Run Email Hunter</button>
           <button class="secondary" onclick="showPage('dmarc')">Check DMARC</button>
@@ -791,10 +848,10 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
         <div class="terminal">
           <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><b>~ email-journeys --live</b></div>
           <div class="term-body">
-            <div class="term-line"><span class="term-prompt">$</span><span class="term-out">hunter crawl --single --bulk</span></div>
+            <div class="term-line"><span class="term-prompt">$</span><span class="term-out">hunter crawl --single --bulk --nav-priority</span></div>
             <div class="term-line"><span class="term-prompt">$</span><span class="term-out">dmarc check --p --sp --filter=none</span></div>
             <div class="term-line"><span class="term-prompt">→</span><span class="term-out cyan">requests + cloudscraper</span></div>
-            <div class="term-line"><span class="term-prompt">→</span><span class="term-out lime">mailto · obfuscated · HTML entities</span></div>
+            <div class="term-line"><span class="term-prompt">→</span><span class="term-out lime">header · nav · footer first</span></div>
             <div class="term-line"><span class="term-prompt">→</span><span class="term-out magenta">email + domain + source page</span></div>
             <div class="term-line"><span class="term-prompt">✓</span><span class="term-out lime">ready</span><span class="term-cursor"></span></div>
           </div>
@@ -834,9 +891,9 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
       </div>
       <div class="feat f-cyan wide" onclick="showPage('hunter')">
         <div class="feat-glow"></div><div class="feat-inner">
-        <span class="feat-tag">05 / HUNT · SINGLE · BULK</span>
-        <h3>Email Hunter — Single &amp; Bulk URL Crawler</h3>
-        <p>Crawl one website or a bulk list. Follows internal navigation links (Contact, About, Team, Impressum, …), extracts publicly available emails, and shows each email with its <b>domain</b> and <b>source page URL(s)</b>. Fixed strict URL validation and host failure limits to eliminate connection errors.</p></div>
+        <span class="feat-tag">05 / HUNT · SINGLE · BULK · NAV PRIORITY</span>
+        <h3>Email Hunter — Nav-aware Crawler</h3>
+        <p>Crawls one website or a bulk list. <b>Extracts header/nav/footer links first</b> (Work &amp; Travel, Joburi, Servicii, Despre, …) then crawls those pages for publicly available emails. Each email shows its <b>domain</b> and <b>source page URL(s)</b>. Handles 404 pages gracefully — still grabs nav/footer links from them.</p></div>
       </div>
       <div class="feat f-magenta wide" onclick="showPage('dmarc')">
         <div class="feat-glow"></div><div class="feat-inner">
@@ -982,7 +1039,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
     <div class="section-head">
       <div>
         <h2>Email <span class="accent">Hunter</span></h2>
-        <p>Crawl a single website or a bulk URL list. Follows internal navigation links (Contact, About, Team, Impressum, …) and extracts publicly available emails — each shown with its <b>domain</b> and <b>source page URL(s)</b>.</p>
+        <p>Crawl a single website or a bulk URL list. Extracts <b>header/nav/footer links first</b> (Work &amp; Travel, Joburi, Servicii, Despre, …) then crawls those pages for publicly available emails — each shown with its <b>domain</b> and <b>source page URL(s)</b>.</p>
       </div>
     </div>
 
@@ -1457,6 +1514,7 @@ function displayHunterResults(d, isBulk) {
     ['Emails', s.emails || 0],
     ['Pages Visited', s.pages_visited || 0],
     ['Contact Pages', s.contact_pages || 0],
+    ['Nav Pages', s.nav_pages || 0],
     ['Discovered', s.discovered || 0],
     ['Errors', s.errors || 0],
     ['Time (s)', s.time_taken || 0],
@@ -2700,7 +2758,6 @@ def email_hunter_start():
     if not raw_urls:
         return jsonify(error="Enter at least one URL"), 400
 
-    # normalize + dedupe
     normalized = []
     seen = set()
     for u in raw_urls:
@@ -2723,6 +2780,7 @@ def email_hunter_start():
             agg = {
                 "pages_visited": 0,
                 "contact_pages": 0,
+                "nav_pages": 0,
                 "errors": 0,
                 "discovered": 0,
                 "visited": 0,
@@ -2743,6 +2801,7 @@ def email_hunter_start():
                     s = res.get("stats", {})
                     agg["pages_visited"] += s.get("pages_visited", 0)
                     agg["contact_pages"] += s.get("contact_pages", 0)
+                    agg["nav_pages"] = agg.get("nav_pages", 0) + s.get("nav_pages", 0)
                     agg["errors"] += s.get("errors", 0)
                     agg["discovered"] += s.get("discovered", 0)
                     agg["visited"] += s.get("visited", 0)
