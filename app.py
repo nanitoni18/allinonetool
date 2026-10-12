@@ -1,7 +1,7 @@
 # ============================================================
 # Email journeys — Single-file Flask App (Neon Nexus Edition)
 # Includes: Converter, Generators, Blocklist, Email Hunter, DMARC Lookup
-# Session: 7 days | Theme: Neon Nexus | Deep-crawl Hunter + Subdomains
+# Session: 7 days | Theme: Neon Nexus
 # ============================================================
 from flask import Flask, request, jsonify, session, redirect, url_for, Response
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -11,7 +11,6 @@ from datetime import timedelta
 import base64, random, string, secrets, socket, ipaddress, os, threading, time, sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# --- Email Hunter deps (optional; app still runs if missing) ---
 try:
     import requests
     from bs4 import BeautifulSoup
@@ -46,7 +45,7 @@ app.config.update(
     SESSION_REFRESH_EACH_REQUEST=True,
 )
 
-SESSION_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
+SESSION_MAX_AGE = 60 * 60 * 24 * 7
 
 LOGIN_USERNAME = os.environ.get("LOGIN_USERNAME", "admin")
 LOGIN_PASSWORD_HASH = generate_password_hash(os.environ.get("LOGIN_PASSWORD", "admin"))
@@ -59,9 +58,6 @@ def _log(msg):
         pass
 
 
-# ============================================================
-# Error handler
-# ============================================================
 @app.errorhandler(Exception)
 def _handle_any_error(e):
     if request.path.startswith("/api/"):
@@ -81,14 +77,13 @@ def healthz():
 
 
 # ============================================================
-# Email Hunter — deep crawler + subdomain hunter
+# Email Hunter — deep crawler (subdomain probing removed)
 # ============================================================
 if HAS_HUNTER:
     HUNTER_MAX_TIME = 240
     HUNTER_TIMEOUT = 20
-    HUNTER_SUBDOMAIN_WORKERS = 24
-    HUNTER_MAX_SUBDOMAINS = 30
-    HUNTER_SUBDOMAIN_FETCH_LIMIT = 12
+    HUNTER_PER_URL_TIME = 180  # max seconds per URL in bulk mode
+    HUNTER_MAX_HOST_FAILURES = 3
 
     HUNTER_UAS = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -99,8 +94,7 @@ if HAS_HUNTER:
     ]
     HUNTER_LINK_ATTRS = [
         "href", "src", "data-url", "data-href", "data-link", "data-target",
-        "data-page", "data-route", "data-menu", "data-items", "data-submenu",
-        "action", "formaction", "onclick"
+        "data-page", "data-route", "action", "formaction", "onclick"
     ]
     HUNTER_CONTACT_KEYWORDS = [
         "contact", "kontakt", "impressum", "about", "team", "directory",
@@ -113,24 +107,11 @@ if HAS_HUNTER:
     HUNTER_GUESS_PATHS = [
         "/kontakt", "/impressum", "/uber-uns", "/ueber-uns", "/team",
         "/ansprechpartner", "/mitarbeiter", "/datenschutz", "/personen",
-        "/generalvikariat", "/ordinariat", "/pfarreien", "/dekanate",
-        "/referate", "/stellenangebote", "/presse", "/medien",
+        "/generalvikariat", "/ordinatiat", "/ordinariat", "/pfarreien",
+        "/dekanate", "/referate", "/stellenangebote", "/presse", "/medien",
         "/contact", "/about", "/about-us", "/contact-us", "/imprint",
         "/contacte", "/despre", "/despre-noi", "/echipa",
         "/parohii", "/parohie", "/episcopie", "/preoti", "/clero",
-    ]
-    HUNTER_SUBDOMAIN_WORDLIST = [
-        "www", "mail", "email", "webmail", "smtp", "mx", "pop", "imap",
-        "mailer", "newsletter",
-        "contact", "contacte", "kontakt", "info", "office", "admin",
-        "sales", "support", "help", "service", "team", "about",
-        "despre", "echipa", "impressum", "hr", "career", "careers",
-        "jobs", "press", "media", "news", "shop", "store", "portal",
-        "crm", "intranet", "extranet", "marketing", "billing",
-        "account", "accounts", "corporate", "partners",
-        "parohie", "parohii", "episcopie", "arhiepiscopie",
-        "clero", "preoti", "biserica", "biserici",
-        "api", "app", "dev", "test", "staging", "beta", "old", "new",
     ]
 
     _EMAIL_RE = _re_h.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
@@ -149,11 +130,20 @@ if HAS_HUNTER:
     )
     _HTML_ENTITY_AT = _re_h.compile(r"&#(?:64|x40|X40);")
     _HTML_ENTITY_DOT = _re_h.compile(r"&#(?:46|x2e|X2E);")
+    _HOSTNAME_OK = _re_h.compile(r"^[a-zA-Z0-9.\-]+(?::\d+)?$")
 
     _BAD_EXT = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp",
                 ".css", ".js", ".ico", ".woff", ".woff2", ".ttf",
                 ".pdf", ".zip", ".mp4", ".mp3", ".doc", ".docx",
                 ".xls", ".xlsx", ".ppt", ".pptx", ".avi", ".mov", ".map")
+
+    _PRIVATE_PREFIXES = (
+        "127.", "10.", "192.168.", "169.254.", "0.",
+        "172.16.", "172.17.", "172.18.", "172.19.",
+        "172.20.", "172.21.", "172.22.", "172.23.",
+        "172.24.", "172.25.", "172.26.", "172.27.",
+        "172.28.", "172.29.", "172.30.", "172.31.",
+    )
 
     def _is_valid_email(e):
         if not e or len(e) > 254 or e.count("@") != 1:
@@ -207,12 +197,15 @@ if HAS_HUNTER:
             self.start_url = start_url.rstrip("/")
             parsed = urlparse(self.start_url)
             self.domain = parsed.netloc.lower()
-            self.base_domain = self.domain[4:] if self.domain.startswith("www.") else self.domain
-            self.domain_alt = "www." + self.base_domain
+            base = self.domain[4:] if self.domain.startswith("www.") else self.domain
+            self.base_domain = base
+            self.domain_alt = "www." + base
 
             self.visited = set()
             self.queue = _deque_h()
             self.emails = set()
+            self.email_sources = {}   # email -> set(page URLs)
+            self.host_failures = {}   # host -> count
 
             self.session = requests.Session()
             self.scraper = None
@@ -224,17 +217,12 @@ if HAS_HUNTER:
                 except Exception:
                     self.scraper = None
 
-            self.subdomains_tried = set()
-            self.subdomains_live = set()
-
             self.stats = {
                 "pages_visited": 0,
                 "contact_pages": 0,
                 "errors": 0,
                 "discovered": 0,
                 "visited": 0,
-                "subdomains_visited": 0,
-                "subdomains_found": 0,
                 "status_codes": {},
             }
             self.start_time = None
@@ -244,6 +232,30 @@ if HAS_HUNTER:
             self._ua_index = (self._ua_index + 1) % len(HUNTER_UAS)
             return HUNTER_UAS[self._ua_index]
 
+        def _is_valid_url(self, url):
+            try:
+                if not url or len(url) > 2000:
+                    return False
+                if any(c in url for c in (" ", "\t", "\n", "\r", "<", ">", '"', "'",
+                                          "{", "}", "|", "\\", "^", "`")):
+                    return False
+                p = urlparse(url)
+                if p.scheme not in ("http", "https"):
+                    return False
+                host = p.netloc.lower()
+                if not host or "." not in host:
+                    return False
+                if not _HOSTNAME_OK.match(host):
+                    return False
+                hostname = host.split(":")[0]
+                if hostname.startswith(_PRIVATE_PREFIXES):
+                    return False
+                if hostname == "localhost":
+                    return False
+                return True
+            except Exception:
+                return False
+
         def _is_internal(self, url):
             try:
                 p = urlparse(url)
@@ -252,8 +264,7 @@ if HAS_HUNTER:
                     return True
                 return (n == self.domain
                         or n == self.domain_alt
-                        or n == self.base_domain
-                        or n.endswith("." + self.base_domain))
+                        or n == self.base_domain)
             except Exception:
                 return False
 
@@ -266,13 +277,19 @@ if HAS_HUNTER:
                     return None
                 low = link.lower()
                 if low.startswith(("mailto:", "tel:", "javascript:", "whatsapp:",
-                                   "sms:", "fax:", "data:", "about:")):
+                                   "sms:", "fax:", "data:", "about:", "ftp:",
+                                   "file:", "chrome:", "chrome-extension:")):
                     return None
                 absolute = urljoin(base, link)
                 p = urlparse(absolute)
                 if p.scheme not in ("http", "https"):
                     return None
-                return urlunparse(p._replace(fragment=""))
+                clean = urlunparse(p._replace(fragment=""))
+                if not self._is_valid_url(clean):
+                    return None
+                if not self._is_internal(clean):
+                    return None
+                return clean
             except Exception:
                 return None
 
@@ -285,7 +302,7 @@ if HAS_HUNTER:
 
             def _add(candidate):
                 u = self._normalize(base_url, candidate)
-                if u and self._is_internal(u):
+                if u:
                     links.add(u)
 
             for a in soup.find_all("a", href=True):
@@ -294,7 +311,7 @@ if HAS_HUNTER:
             for tag in soup.find_all(["link", "area"], href=True):
                 _add(tag.get("href"))
 
-            for nav in soup.find_all(["nav", "menu", "ul", "ol"]):
+            for nav in soup.find_all(["nav", "menu"]):
                 for a in nav.find_all("a", href=True):
                     _add(a.get("href"))
 
@@ -310,7 +327,7 @@ if HAS_HUNTER:
                     if attr == "onclick":
                         for m in _re_h.finditer(r"['\"]([^'\"]+)['\"]", val):
                             inner = m.group(1)
-                            if inner.startswith(("/", "http", ".")):
+                            if inner.startswith(("/", "http")):
                                 _add(inner)
                         for m in _re_h.finditer(r"location\.href\s*=\s*['\"]([^'\"]+)['\"]", val):
                             _add(m.group(1))
@@ -328,107 +345,91 @@ if HAS_HUNTER:
 
                     _add(val)
 
-            for tag in soup.find_all(attrs={"aria-controls": True}):
-                ids = str(tag.get("aria-controls", "")).split()
-                for tid in ids:
-                    target = soup.find(id=tid)
-                    if target:
-                        for a in target.find_all("a", href=True):
-                            _add(a.get("href"))
-
-            for script in soup.find_all("script", type="application/ld+json"):
-                txt = script.string or script.get_text() or ""
-                for m in _re_h.finditer(r'"(?:url|@id|sameAs|item|target)"\s*:\s*"([^"]+)"', txt):
-                    _add(m.group(1))
-                for m in _re_h.finditer(r'"(https?://[^"]+)"', txt):
-                    _add(m.group(1))
-
-            for script in soup.find_all("script"):
-                if script.get("src"):
-                    continue
-                txt = script.string or script.get_text() or ""
-                if not txt or len(txt) > 500000:
-                    continue
-                for m in _re_h.finditer(
-                    r"['\"]((?:https?://[^'\"\s<>]+)|(?:/[a-zA-Z0-9_\-./]{2,}))['\"]",
-                    txt
-                ):
-                    _add(m.group(1))
-                for m in _re_h.finditer(r'"(?:path|href|url|link|to)"\s*:\s*"([^"]+)"', txt):
-                    _add(m.group(1))
-
-            for opt in soup.find_all("option"):
-                v = opt.get("value")
-                if v and (v.startswith("/") or v.startswith("http")):
-                    _add(v)
-
             for form in soup.find_all("form", action=True):
                 _add(form.get("action"))
 
-            for tmpl in soup.find_all("template"):
-                for a in tmpl.find_all("a", href=True):
-                    _add(a.get("href"))
-                for a in tmpl.find_all(True):
-                    for attr in ("data-url", "data-href", "data-link"):
-                        v = a.get(attr)
-                        if v:
-                            _add(v)
+            for opt in soup.find_all("option"):
+                v = opt.get("value")
+                if v:
+                    _add(v)
 
             return links
 
-        def _fetch(self, url, _retry=0):
+        def _fetch(self, url):
+            # strict pre-flight checks
+            if not self._is_valid_url(url):
+                return None
+            try:
+                host = urlparse(url).netloc.lower()
+            except Exception:
+                return None
+
+            if self.host_failures.get(host, 0) >= HUNTER_MAX_HOST_FAILURES:
+                return None
+
             headers = {
                 "User-Agent": self._ua(),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9,de;q=0.8,fr;q=0.7,ro;q=0.6",
-                "Accept-Encoding": "gzip, deflate, br",
                 "Connection": "keep-alive",
                 "Upgrade-Insecure-Requests": "1",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
-                "Sec-Fetch-User": "?1",
-                "Cache-Control": "max-age=0",
                 "DNT": "1",
             }
 
+            # 1) plain requests
             try:
                 r = self.session.get(url, headers=headers, timeout=HUNTER_TIMEOUT,
                                      allow_redirects=True, verify=False)
+                ctype = (r.headers.get("Content-Type") or "").lower()
                 if r.status_code == 200 and r.text:
+                    if ctype and not any(t in ctype for t in (
+                            "text/html", "text/plain", "application/xhtml",
+                            "application/xml", "text/xml")):
+                        _log(f"[HUNTER SKIP-CTYPE] {ctype[:40]} {url}")
+                        return None
                     if r.encoding and r.encoding.lower() in ("iso-8859-1", "ascii"):
                         r.encoding = r.apparent_encoding or "utf-8"
-                    _log(f"[HUNTER OK-requests] {r.status_code} len={len(r.text)} {url}")
+                    self.host_failures.pop(host, None)
+                    _log(f"[HUNTER OK] {r.status_code} len={len(r.text)} {url}")
                     return r.text
                 self.stats["status_codes"][str(r.status_code)] = \
                     self.stats["status_codes"].get(str(r.status_code), 0) + 1
+                if r.status_code >= 400:
+                    self.host_failures[host] = self.host_failures.get(host, 0) + 1
                 _log(f"[HUNTER STATUS] {r.status_code} {url}")
-                if r.status_code in (403, 429, 503) and _retry < 1:
-                    time.sleep(1.2)
-            except requests.exceptions.SSLError as e:
-                _log(f"[HUNTER SSL-ERR] {url} :: {e}")
             except requests.exceptions.Timeout:
+                self.host_failures[host] = self.host_failures.get(host, 0) + 1
                 _log(f"[HUNTER TIMEOUT] {url}")
             except requests.exceptions.ConnectionError as e:
+                self.host_failures[host] = self.host_failures.get(host, 0) + 1
                 _log(f"[HUNTER CONN-ERR] {url} :: {e}")
+            except requests.exceptions.SSLError:
+                self.host_failures[host] = self.host_failures.get(host, 0) + 1
+                _log(f"[HUNTER SSL-ERR] {url}")
             except Exception as e:
+                self.host_failures[host] = self.host_failures.get(host, 0) + 1
                 _log(f"[HUNTER REQ-ERR] {url} :: {type(e).__name__}: {e}")
 
+            # 2) cloudscraper
             if self.scraper is not None:
                 try:
                     r = self.scraper.get(url, headers=headers, timeout=HUNTER_TIMEOUT,
                                          allow_redirects=True)
+                    ctype = (r.headers.get("Content-Type") or "").lower()
                     if r.status_code == 200 and r.text:
+                        if ctype and not any(t in ctype for t in (
+                                "text/html", "text/plain", "application/xhtml",
+                                "application/xml", "text/xml")):
+                            return None
                         if r.encoding and r.encoding.lower() in ("iso-8859-1", "ascii"):
                             r.encoding = r.apparent_encoding or "utf-8"
-                        _log(f"[HUNTER OK-cloudscraper] {r.status_code} len={len(r.text)} {url}")
+                        self.host_failures.pop(host, None)
+                        _log(f"[HUNTER OK-CS] {r.status_code} len={len(r.text)} {url}")
                         return r.text
-                    _log(f"[HUNTER CS-STATUS] {r.status_code} {url}")
                 except Exception as e:
                     _log(f"[HUNTER CS-ERR] {url} :: {type(e).__name__}: {e}")
 
             self.stats["errors"] += 1
-            _log(f"[HUNTER FAIL] {url}")
             return None
 
         def _discover_sitemaps(self):
@@ -469,52 +470,6 @@ if HAS_HUNTER:
                 pass
             return urls
 
-        def _discover_subdomains(self):
-            found = set()
-            _log(f"[HUNTER SUBS] probing wordlist for {self.base_domain}...")
-
-            def _check(sub):
-                host = f"{sub}.{self.base_domain}"
-                try:
-                    ip = socket.gethostbyname(host)
-                    return (host, ip)
-                except Exception:
-                    return None
-
-            try:
-                with ThreadPoolExecutor(max_workers=HUNTER_SUBDOMAIN_WORKERS) as ex:
-                    futures = {ex.submit(_check, s): s for s in HUNTER_SUBDOMAIN_WORDLIST}
-                    for fut in as_completed(futures):
-                        try:
-                            res = fut.result()
-                            if res:
-                                host, ip = res
-                                found.add(host)
-                                _log(f"[HUNTER SUB-HIT] {host} -> {ip}")
-                        except Exception:
-                            pass
-            except Exception as e:
-                _log(f"[HUNTER SUBS-ERR] wordlist: {e}")
-
-            try:
-                r = self.session.get(
-                    f"https://crt.sh/?q=%25.{self.base_domain}&output=json",
-                    timeout=12, verify=False,
-                )
-                if r.status_code == 200:
-                    data = r.json()
-                    for item in data:
-                        names = item.get("name_value", "") or ""
-                        for n in str(names).split("\n"):
-                            n = n.strip().lower().lstrip("*.").rstrip(".")
-                            if n.endswith("." + self.base_domain) and "*" not in n:
-                                found.add(n)
-                    _log(f"[HUNTER SUBS] crt.sh added (total now {len(found)})")
-            except Exception as e:
-                _log(f"[HUNTER SUBS] crt.sh skip: {e}")
-
-            return found
-
         def _prioritize(self):
             prior, rest = [], []
             while self.queue:
@@ -528,13 +483,11 @@ if HAS_HUNTER:
                     self.queue.append(u)
                     self.stats["discovered"] += 1
 
-        def _seed_host(self, host):
-            base = f"https://{host}"
-            self.queue.append(base)
-            self.stats["discovered"] += 1
-            for path in HUNTER_GUESS_PATHS:
-                self.queue.append(base + path)
-                self.stats["discovered"] += 1
+        def _record_email(self, email, page_url):
+            if not _is_valid_email(email):
+                return
+            self.emails.add(email)
+            self.email_sources.setdefault(email, set()).add(page_url)
 
         def crawl(self):
             self.start_time = time.time()
@@ -546,30 +499,16 @@ if HAS_HUNTER:
 
             for sm in self._discover_sitemaps():
                 for u in self._parse_sitemap(sm):
-                    if self._is_internal(u) and u not in self.visited:
+                    if self._is_valid_url(u) and self._is_internal(u) and u not in self.visited:
                         self.queue.append(u)
                         self.stats["discovered"] += 1
 
             for path in HUNTER_GUESS_PATHS:
                 candidate = urljoin(self.start_url, path)
-                if self._is_internal(candidate) and candidate not in self.visited:
+                if self._is_valid_url(candidate) and self._is_internal(candidate) \
+                        and candidate not in self.visited:
                     self.queue.append(candidate)
                     self.stats["discovered"] += 1
-
-            try:
-                subs = self._discover_subdomains()
-            except Exception as e:
-                _log(f"[HUNTER SUBS-ERR] {e}")
-                subs = set()
-
-            self.subdomains_live = set(subs)
-            self.stats["subdomains_found"] = len(subs)
-
-            crawl_subs = list(subs)[:HUNTER_SUBDOMAIN_FETCH_LIMIT]
-            for host in crawl_subs:
-                self._seed_host(host)
-
-            _log(f"[HUNTER QUEUE] subs_found={len(subs)} subs_crawling={len(crawl_subs)} discovered={self.stats['discovered']}")
 
             while self.queue and (time.time() - self.start_time) < HUNTER_MAX_TIME:
                 self._prioritize()
@@ -584,30 +523,26 @@ if HAS_HUNTER:
                     continue
 
                 self.stats["pages_visited"] += 1
-                host = urlparse(url).netloc.lower()
-                if host != self.domain and host != self.domain_alt and host != self.base_domain:
-                    self.stats["subdomains_visited"] += 1
                 if self._is_contact(url):
                     self.stats["contact_pages"] += 1
 
-                emails_here = hunter_extract_emails(html)
-                if emails_here:
-                    _log(f"[HUNTER EMAILS] {len(emails_here)} on {url}")
-                self.emails.update(emails_here)
+                # extract emails from raw HTML
+                for e in hunter_extract_emails(html):
+                    self._record_email(e, url)
 
                 try:
                     soup = BeautifulSoup(html, "html.parser")
                 except Exception:
                     continue
 
+                # extract mailto links
                 for a in soup.find_all("a", href=True):
                     href = str(a["href"])
                     if href.lower().startswith("mailto:"):
                         e = href[7:].split("?")[0].strip().lower()
-                        if _is_valid_email(e):
-                            self.emails.add(e)
-                            _log(f"[HUNTER MAILTO] {e}")
+                        self._record_email(e, url)
 
+                # extract new internal links
                 new_links = self._extract_links(soup, url)
                 self._enqueue_many(new_links)
 
@@ -615,26 +550,21 @@ if HAS_HUNTER:
             _log(f"[HUNTER SUMMARY] domain={self.base_domain}")
             _log(f"  pages_visited   = {self.stats['pages_visited']}")
             _log(f"  contact_pages   = {self.stats['contact_pages']}")
-            _log(f"  subdomains_found= {self.stats['subdomains_found']}")
-            _log(f"  subdomains_live = {sorted(self.subdomains_live)}")
-            _log(f"  subdomains_visited = {self.stats['subdomains_visited']}")
             _log(f"  status_codes    = {self.stats.get('status_codes', {})}")
             _log(f"  errors          = {self.stats['errors']}")
             _log(f"  discovered      = {self.stats['discovered']}")
             _log(f"  visited         = {self.stats['visited']}")
             _log(f"  emails_found    = {len(self.emails)}")
-            if self.emails:
-                _log(f"  emails          = {sorted(self.emails)}")
             _log(f"  time_taken      = {round(time.time() - self.start_time, 2)}s")
             _log("=" * 60)
 
             self.stats["emails"] = len(self.emails)
             self.stats["time_taken"] = round(time.time() - self.start_time, 2)
-            self.stats["subdomains_list"] = sorted(self.subdomains_live)
             return {
                 "emails": sorted(self.emails),
+                "email_sources": {e: sorted(list(us)) for e, us in self.email_sources.items()},
                 "stats": self.stats,
-                "subdomains": sorted(self.subdomains_live),
+                "url": self.start_url,
             }
 
     _hunter_store = {}
@@ -808,17 +738,17 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
 .toast.ok{border-color:color-mix(in srgb,var(--ok) 50%,transparent);color:var(--ok)}
 .toast.err{border-color:color-mix(in srgb,var(--danger) 50%,transparent);color:var(--danger)}
 @keyframes toastIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
-.session-banner{position:fixed;top:14px;left:50%;transform:translateX(-50%);z-index:200;padding:9px 16px;border-radius:99px;background:var(--panel-solid);border:1px solid var(--line);color:var(--muted);font-size:12px;font-weight:500;box-shadow:var(--shadow);display:none;backdrop-filter:blur(16px)}
-.session-banner.show{display:block;animation:toastIn .3s ease}
-.session-banner b{background:linear-gradient(100deg,var(--cyan),var(--magenta));-webkit-background-clip:text;background-clip:text;color:transparent}
-.subs-list{margin-top:14px;padding:14px;border:1px dashed var(--line-strong);border-radius:12px;background:var(--panel-2);font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--text-soft);max-height:180px;overflow:auto;white-space:pre-wrap}
+.hunter-email-cell{font-family:'JetBrains Mono',monospace;font-size:11.5px;font-weight:600;color:var(--text);word-break:break-all}
+.hunter-domain-cell{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);word-break:break-all}
+.hunter-pages-cell{font-size:11px;text-align:left}
+.hunter-pages-cell a{color:var(--cyan);text-decoration:none;display:block;margin:3px 0;word-break:break-all}
+.hunter-pages-cell a:hover{text-decoration:underline}
 @media(max-width:980px){.home-wrap{grid-template-columns:1fr}.feature-grid{grid-template-columns:1fr 1fr}.feat,.feat.wide{grid-column:span 1}.feat.wide{grid-column:span 2}.quick-stats{grid-template-columns:repeat(2,1fr)}.workspace,.controls3{grid-template-columns:1fr}.bl-form{grid-template-columns:1fr}.bl-summary{grid-template-columns:repeat(3,1fr)}}@media(max-width:640px){.app{padding:14px 14px 0}.topbar{position:static}.nav{width:100%}.nav button{flex:1 1 auto}.feature-grid{grid-template-columns:1fr}.feat,.feat.wide{grid-column:auto}.quick-stats{grid-template-columns:repeat(2,1fr)}.bl-summary{grid-template-columns:repeat(2,1fr)}.output-wrap{flex-direction:column}.copy-btn{padding:11px;width:100%}}
 </style>
 </head>
 <body>
 <div class="bg-grid"></div>
 <div class="bg-orbs"><span></span><span></span><span></span><span></span></div>
-<div id="session-banner" class="session-banner">Session expires in <b id="session-countdown">60:00</b></div>
 
 <div class="app">
   <header class="topbar">
@@ -830,7 +760,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
         <path d="M32 5 55 18v28L32 59 9 46V18z" fill="none" stroke="url(#lg)" stroke-width="3.5" stroke-linejoin="round"/>
         <text x="32" y="40" text-anchor="middle" font-family="Space Grotesk,sans-serif" font-size="19" font-weight="700" fill="url(#lg)">EJ</text>
       </svg>
-      <div><b>Email journeys</b><span>NEON NEXUS · V9</span></div>
+      <div><b>Email journeys</b><span>NEON NEXUS · V10</span></div>
     </div>
     <nav class="nav">
       <button id="nav-home" onclick="showPage('home')">Home</button>
@@ -851,7 +781,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
           <span class="line-1">The email ops</span>
           <span class="line-2">command center.</span>
         </h1>
-        <p class="hero-desc">Encode subject lines, forge identities, audit sending IPs, hunt down publicly available addresses, and filter emails by <code>DMARC</code> posture (p= and sp=).</p>
+        <p class="hero-desc">Encode subject lines, forge identities, audit sending IPs, hunt publicly available emails across single or bulk URLs, and filter emails by <code>DMARC</code> posture (p= and sp=).</p>
         <div class="hero-actions">
           <button class="primary" onclick="showPage('hunter')">Run Email Hunter</button>
           <button class="secondary" onclick="showPage('dmarc')">Check DMARC</button>
@@ -861,11 +791,11 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
         <div class="terminal">
           <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><b>~ email-journeys --live</b></div>
           <div class="term-body">
-            <div class="term-line"><span class="term-prompt">$</span><span class="term-out">hunter crawl --deep --subdomains</span></div>
+            <div class="term-line"><span class="term-prompt">$</span><span class="term-out">hunter crawl --single --bulk</span></div>
             <div class="term-line"><span class="term-prompt">$</span><span class="term-out">dmarc check --p --sp --filter=none</span></div>
             <div class="term-line"><span class="term-prompt">→</span><span class="term-out cyan">requests + cloudscraper</span></div>
-            <div class="term-line"><span class="term-prompt">→</span><span class="term-out lime">mail · contact · info · support subs</span></div>
-            <div class="term-line"><span class="term-prompt">→</span><span class="term-out magenta">mailto · obfuscated · HTML entities</span></div>
+            <div class="term-line"><span class="term-prompt">→</span><span class="term-out lime">mailto · obfuscated · HTML entities</span></div>
+            <div class="term-line"><span class="term-prompt">→</span><span class="term-out magenta">email + domain + source page</span></div>
             <div class="term-line"><span class="term-prompt">✓</span><span class="term-out lime">ready</span><span class="term-cursor"></span></div>
           </div>
         </div>
@@ -904,9 +834,9 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
       </div>
       <div class="feat f-cyan wide" onclick="showPage('hunter')">
         <div class="feat-glow"></div><div class="feat-inner">
-        <span class="feat-tag">05 / HUNT · DEEP CRAWL · SUBDOMAINS</span>
-        <h3>Email Hunter — Multi-layer Crawler</h3>
-        <p>Requests + cloudscraper. Discovers and crawls subdomains via DNS wordlist and crt.sh. Extracts plain, mailto, obfuscated, and HTML-entity emails. Public content only.</p></div>
+        <span class="feat-tag">05 / HUNT · SINGLE · BULK</span>
+        <h3>Email Hunter — Single &amp; Bulk URL Crawler</h3>
+        <p>Crawl one website or a bulk list. Follows internal navigation links (Contact, About, Team, Impressum, …), extracts publicly available emails, and shows each email with its <b>domain</b> and <b>source page URL(s)</b>. Fixed strict URL validation and host failure limits to eliminate connection errors.</p></div>
       </div>
       <div class="feat f-magenta wide" onclick="showPage('dmarc')">
         <div class="feat-glow"></div><div class="feat-inner">
@@ -1052,33 +982,66 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
     <div class="section-head">
       <div>
         <h2>Email <span class="accent">Hunter</span></h2>
-        <p>Enter any website URL. The hunter crawls its public pages <em>and discovers subdomains</em> (DNS wordlist + crt.sh). Uses requests + cloudscraper. Extracts plain, <code>mailto:</code>, obfuscated, and HTML-entity emails.</p>
+        <p>Crawl a single website or a bulk URL list. Follows internal navigation links (Contact, About, Team, Impressum, …) and extracts publicly available emails — each shown with its <b>domain</b> and <b>source page URL(s)</b>.</p>
       </div>
     </div>
-    <div class="card">
-      <label class="label" for="hunter-url">Website URL</label>
-      <div style="display:flex;gap:10px;flex-wrap:wrap">
-        <input id="hunter-url" type="text" placeholder="https://example.com" autocomplete="off" spellcheck="false" style="flex:1;min-width:240px">
-        <button class="primary" id="hunter-btn" onclick="startEmailHunter()">Start Crawl</button>
-        <button class="secondary" id="hunter-cancel" onclick="cancelEmailHunter()" disabled>Cancel</button>
-      </div>
-      <div id="hunter-status" class="status" style="margin-top:14px"></div>
-      <div class="bl-progress hidden" id="hunter-progress" style="margin-top:6px">
-        <div class="bl-progress-bar" id="hunter-progress-bar" style="width:8%"></div>
+
+    <div class="tabs">
+      <button id="hunter-single-tab" class="tab active" onclick="hunterTab('single')">Single Website URL</button>
+      <button id="hunter-bulk-tab" class="tab" onclick="hunterTab('bulk')">Bulk Website URLs</button>
+    </div>
+
+    <div id="hunter-single-panel">
+      <div class="card">
+        <label class="label" for="hunter-url">Website URL</label>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <input id="hunter-url" type="text" placeholder="https://example.com" autocomplete="off" spellcheck="false" style="flex:1;min-width:240px">
+          <button class="primary" id="hunter-btn" onclick="startEmailHunter(false)">Start Crawl</button>
+          <button class="secondary" id="hunter-cancel" onclick="cancelEmailHunter()" disabled>Cancel</button>
+        </div>
+        <div id="hunter-status" class="status" style="margin-top:14px"></div>
+        <div class="bl-progress hidden" id="hunter-progress" style="margin-top:6px">
+          <div class="bl-progress-bar" id="hunter-progress-bar" style="width:8%"></div>
+        </div>
       </div>
     </div>
+
+    <div id="hunter-bulk-panel" class="hidden">
+      <div class="card">
+        <label class="label" for="hunter-urls">Website URLs (one per line)</label>
+        <textarea id="hunter-urls" placeholder="https://example.com&#10;https://another.com&#10;https://third.com" style="min-height:180px"></textarea>
+        <p class="helper" style="margin-top:8px">Each URL crawled independently. Emails from all sites are merged; duplicates removed automatically.</p>
+        <div class="actions">
+          <button class="primary" id="hunter-bulk-btn" onclick="startEmailHunter(true)">Start Bulk Crawl</button>
+          <button class="secondary" id="hunter-bulk-cancel" onclick="cancelEmailHunter()" disabled>Cancel</button>
+        </div>
+        <div id="hunter-bulk-status" class="status" style="margin-top:12px"></div>
+        <div class="bl-progress hidden" id="hunter-bulk-progress" style="margin-top:6px">
+          <div class="bl-progress-bar" id="hunter-bulk-progress-bar" style="width:8%"></div>
+        </div>
+      </div>
+    </div>
+
     <div id="hunter-stats" class="bl-summary hidden" style="margin-top:20px"></div>
-    <div class="card" id="hunter-subs-card" style="margin-top:20px;display:none">
-      <h3>Subdomains Found (<span id="hunter-subs-count">0</span>)</h3>
-      <div class="subs-list" id="hunter-subs-list"></div>
-    </div>
+
     <div class="card" id="hunter-emails-card" style="margin-top:20px;display:none">
       <h3>Emails Found (<span id="hunter-count">0</span>)</h3>
       <div class="actions" style="margin-top:0;margin-bottom:12px">
-        <button class="secondary" onclick="copyHunterEmails(this)">Copy All</button>
-        <button class="secondary" onclick="exportHunterCsv()">Export CSV</button>
+        <button class="secondary" onclick="copyHunterEmails(this)">Copy Emails</button>
+        <button class="secondary" onclick="exportHunterCsv()">Export CSV (Email, Domain, Pages)</button>
       </div>
-      <div id="hunter-emails" class="output" style="min-height:80px;max-height:520px;overflow:auto"></div>
+      <div class="bl-table-wrap" style="max-height:620px">
+        <table class="bl-table" style="min-width:900px">
+          <thead>
+            <tr>
+              <th style="text-align:left;width:24%">Email</th>
+              <th style="text-align:left;width:18%">Domain</th>
+              <th style="text-align:left">Source Pages</th>
+            </tr>
+          </thead>
+          <tbody id="hunter-emails-tbody"></tbody>
+        </table>
+      </div>
     </div>
   </section>
 
@@ -1198,7 +1161,6 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
 const $ = (id) => document.getElementById(id);
 const PAGES = ['home', 'converter', 'generator', 'blocklist', 'hunter', 'dmarc'];
 const state = { blAbort: null, blData: null };
-const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const SESSION_START_KEY = 'ej_session_start';
 function sessionStart() {
   sessionStorage.setItem(SESSION_START_KEY, String(Date.now()));
@@ -1230,6 +1192,12 @@ function dmarcTab(which) {
   $('dmarc-bulk-panel').classList.toggle('hidden', which !== 'bulk');
   $('dmarc-single-tab').classList.toggle('active', which === 'single');
   $('dmarc-bulk-tab').classList.toggle('active', which === 'bulk');
+}
+function hunterTab(which) {
+  $('hunter-single-panel').classList.toggle('hidden', which !== 'single');
+  $('hunter-bulk-panel').classList.toggle('hidden', which !== 'bulk');
+  $('hunter-single-tab').classList.toggle('active', which === 'single');
+  $('hunter-bulk-tab').classList.toggle('active', which === 'bulk');
 }
 function toggleTheme() {
   const light = document.body.classList.toggle('light');
@@ -1406,95 +1374,175 @@ function exportBlocklistCsv() {
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   URL.revokeObjectURL(url); toast('CSV exported', 'ok');
 }
-const hunterState = { abort: null, sid: null, pollTimer: null, data: null };
-async function startEmailHunter() {
-  const url = $('hunter-url').value.trim();
-  if (!url) { toast('Please enter a URL', 'err'); return; }
-  const btn = $('hunter-btn'), cancelBtn = $('hunter-cancel');
-  const status = $('hunter-status'), progress = $('hunter-progress'), bar = $('hunter-progress-bar');
-  hunterState.abort = new AbortController(); hunterState.data = null;
+
+/* ---------------- Email Hunter ---------------- */
+const hunterState = { abort: null, sid: null, pollTimer: null, data: null, isBulk: false };
+
+async function startEmailHunter(isBulk) {
+  const urlInput = isBulk ? $('hunter-urls').value.trim() : $('hunter-url').value.trim();
+  if (!urlInput) { toast('Enter at least one URL', 'err'); return; }
+
+  hunterState.isBulk = isBulk;
+  const btn = isBulk ? $('hunter-bulk-btn') : $('hunter-btn');
+  const cancelBtn = isBulk ? $('hunter-bulk-cancel') : $('hunter-cancel');
+  const status = isBulk ? $('hunter-bulk-status') : $('hunter-status');
+  const progress = isBulk ? $('hunter-bulk-progress') : $('hunter-progress');
+  const bar = isBulk ? $('hunter-bulk-progress-bar') : $('hunter-progress-bar');
+
+  hunterState.abort = new AbortController();
+  hunterState.data = null;
+
   btn.disabled = true; btn.textContent = 'Crawling…'; cancelBtn.disabled = false;
   progress.classList.remove('hidden'); bar.style.width = '8%';
   $('hunter-stats').classList.add('hidden');
-  $('hunter-subs-card').style.display = 'none';
   $('hunter-emails-card').style.display = 'none';
+
   const startedAt = Date.now();
   const tick = setInterval(function () {
     const s = ((Date.now() - startedAt) / 1000).toFixed(0);
-    status.textContent = 'Crawling ' + url + '… ' + s + 's (max 240s)';
-    const pct = Math.min(95, 8 + (s / 240) * 87);
+    status.textContent = 'Starting crawl… running ' + s + 's (max 240s)';
+    const pct = Math.min(95, 8 + (Number(s) / 240) * 87);
     bar.style.width = pct.toFixed(1) + '%';
   }, 1000);
-  status.textContent = 'Starting crawl…';
+  status.textContent = 'Starting crawl… running 0s';
+
   try {
-    const d = await api('/api/email-hunter/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: url }), signal: hunterState.abort.signal });
+    const body = isBulk ? { urls: urlInput } : { url: urlInput };
+    const d = await api('/api/email-hunter/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: hunterState.abort.signal,
+    });
     hunterState.sid = d.session_id;
-    clearInterval(tick); pollHunterResults(startedAt, tick);
+    clearInterval(tick);
+    pollHunterResults(startedAt, tick, isBulk);
   } catch (e) {
-    clearInterval(tick); finishHunterUi();
+    clearInterval(tick); finishHunterUi(isBulk);
     if (e.name === 'AbortError') status.textContent = 'Cancelled.';
     else { status.textContent = e.message; toast(e.message, 'err'); }
   }
 }
-function pollHunterResults(startedAt, tick) {
-  const status = $('hunter-status');
+
+function pollHunterResults(startedAt, tick, isBulk) {
+  const status = isBulk ? $('hunter-bulk-status') : $('hunter-status');
   hunterState.pollTimer = setInterval(async function () {
     if (!hunterState.sid) return;
     try {
       const d = await api('/api/email-hunter/results/' + hunterState.sid, { method: 'GET' });
       if (d.status === 'running') return;
-      clearInterval(tick); clearInterval(hunterState.pollTimer); hunterState.pollTimer = null;
-      if (d.error) { status.textContent = 'Error: ' + d.error; toast(d.error, 'err'); finishHunterUi(); return; }
-      hunterState.data = d; displayHunterResults(d); finishHunterUi();
-      $('hunter-progress-bar').style.width = '100%';
-      setTimeout(function () { $('hunter-progress').classList.add('hidden'); }, 600);
+      clearInterval(tick);
+      if (hunterState.pollTimer) { clearInterval(hunterState.pollTimer); hunterState.pollTimer = null; }
+      if (d.error) { status.textContent = 'Error: ' + d.error; toast(d.error, 'err'); finishHunterUi(isBulk); return; }
+      hunterState.data = d;
+      displayHunterResults(d, isBulk);
+      finishHunterUi(isBulk);
+      const prog = isBulk ? $('hunter-bulk-progress') : $('hunter-progress');
+      const pb = isBulk ? $('hunter-bulk-progress-bar') : $('hunter-progress-bar');
+      pb.style.width = '100%';
+      setTimeout(function () { prog.classList.add('hidden'); }, 700);
     } catch (e) {
-      clearInterval(tick); clearInterval(hunterState.pollTimer); hunterState.pollTimer = null;
-      status.textContent = e.message; finishHunterUi();
+      clearInterval(tick);
+      if (hunterState.pollTimer) { clearInterval(hunterState.pollTimer); hunterState.pollTimer = null; }
+      status.textContent = e.message;
+      finishHunterUi(isBulk);
     }
   }, 1500);
 }
-function displayHunterResults(d) {
+
+function displayHunterResults(d, isBulk) {
   const s = d.stats || {};
   const stats = $('hunter-stats');
   const items = [
-    ['Emails', s.emails || 0], ['Pages', s.pages_visited || 0], ['Contact', s.contact_pages || 0],
-    ['Subs Found', s.subdomains_found || 0], ['Subs Visited', s.subdomains_visited || 0],
-    ['Discovered', s.discovered || 0], ['Errors', s.errors || 0], ['Time (s)', s.time_taken || 0],
+    ['Emails', s.emails || 0],
+    ['Pages Visited', s.pages_visited || 0],
+    ['Contact Pages', s.contact_pages || 0],
+    ['Discovered', s.discovered || 0],
+    ['Errors', s.errors || 0],
+    ['Time (s)', s.time_taken || 0],
   ];
-  stats.innerHTML = items.map(function (x) { return '<div class="bl-summary-item"><b>' + esc(x[1]) + '</b><span>' + esc(x[0]) + '</span></div>'; }).join('');
+  stats.innerHTML = items.map(function (x) {
+    return '<div class="bl-summary-item"><b>' + esc(x[1]) + '</b><span>' + esc(x[0]) + '</span></div>';
+  }).join('');
   stats.classList.remove('hidden');
-  const subs = d.subdomains || [];
-  $('hunter-subs-count').textContent = subs.length;
-  $('hunter-subs-list').textContent = subs.length ? subs.join('\n') : 'No subdomains found.';
-  $('hunter-subs-card').style.display = 'block';
+
   const emails = d.emails || [];
+  const sources = d.email_sources || {};
   $('hunter-count').textContent = emails.length;
-  $('hunter-emails').textContent = emails.length ? emails.join('\n') : 'No emails found.';
+
+  const tbody = $('hunter-emails-tbody');
+  if (!emails.length) {
+    tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:var(--muted);padding:24px">No emails found.</td></tr>';
+  } else {
+    tbody.innerHTML = emails.map(function (e) {
+      const domain = (e.split('@')[1] || '');
+      const urls = sources[e] || [];
+      const urlsHtml = urls.length
+        ? urls.map(function (u) {
+            return '<a href="' + esc(u) + '" target="_blank" rel="noopener">' + esc(u) + '</a>';
+          }).join('')
+        : '<span style="color:var(--muted)">—</span>';
+      return '<tr>' +
+        '<td class="hunter-email-cell">' + esc(e) + '</td>' +
+        '<td class="hunter-domain-cell">' + esc(domain) + '</td>' +
+        '<td class="hunter-pages-cell">' + urlsHtml + '</td>' +
+        '</tr>';
+    }).join('');
+  }
   $('hunter-emails-card').style.display = 'block';
-  const codes = s.status_codes || {};
-  const codesStr = Object.keys(codes).length ? ' HTTP: ' + Object.entries(codes).map(([k,v]) => k + '×' + v).join(', ') : '';
-  $('hunter-status').textContent = 'Done — ' + emails.length + ' email' + (emails.length === 1 ? '' : 's') + ', ' + subs.length + ' subdomain' + (subs.length === 1 ? '' : 's') + ' in ' + (s.time_taken || 0) + 's.' + codesStr;
+
+  const urlsCount = (d.urls && d.urls.length) ? d.urls.length : 1;
+  const target = isBulk ? $('hunter-bulk-status') : $('hunter-status');
+  target.textContent = 'Done — ' + emails.length + ' email' + (emails.length === 1 ? '' : 's') +
+                       ' from ' + urlsCount + ' URL' + (urlsCount === 1 ? '' : 's') +
+                       ' in ' + (s.time_taken || 0) + 's.';
 }
-function finishHunterUi() {
-  const btn = $('hunter-btn');
-  btn.disabled = false; btn.textContent = 'Start Crawl';
-  $('hunter-cancel').disabled = true; hunterState.abort = null;
+
+function finishHunterUi(isBulk) {
+  const btn = isBulk ? $('hunter-bulk-btn') : $('hunter-btn');
+  const cancelBtn = isBulk ? $('hunter-bulk-cancel') : $('hunter-cancel');
+  btn.disabled = false;
+  btn.textContent = isBulk ? 'Start Bulk Crawl' : 'Start Crawl';
+  cancelBtn.disabled = true;
+  hunterState.abort = null;
 }
+
 function cancelEmailHunter() {
   if (hunterState.pollTimer) { clearInterval(hunterState.pollTimer); hunterState.pollTimer = null; }
   if (hunterState.abort) hunterState.abort.abort();
-  finishHunterUi();
+  ['hunter', 'hunter-bulk'].forEach(function (prefix) {
+    const btn = $(prefix + '-btn');
+    const cancelBtn = $(prefix + '-cancel');
+    if (btn) { btn.disabled = false; btn.textContent = prefix === 'hunter-bulk' ? 'Start Bulk Crawl' : 'Start Crawl'; }
+    if (cancelBtn) cancelBtn.disabled = true;
+  });
   $('hunter-status').textContent = 'Cancelled.';
-  setTimeout(function () { $('hunter-progress').classList.add('hidden'); }, 500);
+  $('hunter-bulk-status').textContent = 'Cancelled.';
+  hunterState.abort = null;
+  setTimeout(function () {
+    $('hunter-progress').classList.add('hidden');
+    $('hunter-bulk-progress').classList.add('hidden');
+  }, 500);
 }
+
 async function copyHunterEmails(btn) {
   if (!hunterState.data || !hunterState.data.emails) { toast('Nothing to copy', 'err'); return; }
   await copyValue(hunterState.data.emails.join('\n'), btn);
 }
+
 function exportHunterCsv() {
   if (!hunterState.data || !hunterState.data.emails) { toast('Nothing to export', 'err'); return; }
-  const lines = ['Email'].concat(hunterState.data.emails);
+  const sources = hunterState.data.email_sources || {};
+  const lines = ['Email,Domain,Pages'];
+  hunterState.data.emails.forEach(function (e) {
+    const domain = e.split('@')[1] || '';
+    const urls = (sources[e] || []).join(' | ');
+    const row = [e, domain, urls].map(function (v) {
+      const s = String(v === null || v === undefined ? '' : v);
+      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    }).join(',');
+    lines.push(row);
+  });
   const blob = new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob); const a = document.createElement('a');
   a.href = url; a.download = 'emails-hunted.csv';
@@ -1704,7 +1752,7 @@ document.addEventListener('keydown', function (e) {
     const active = document.activeElement;
     if (active && active.id === 'enc-input') encodeText();
     if (active && active.id === 'dec-input') decodeText();
-    if (active && active.id === 'hunter-url') startEmailHunter();
+    if (active && active.id === 'hunter-url') startEmailHunter(false);
     if (active && active.id === 'dmarc-domain') runDmarcCheck();
   }
 });
@@ -1714,7 +1762,7 @@ document.addEventListener('keydown', function (e) {
 
 
 # ============================================================
-# Auth (with healthz bypass)
+# Auth
 # ============================================================
 @app.before_request
 def auth():
@@ -2244,7 +2292,6 @@ DMARC_BULK_MAX_EMAILS = int(os.environ.get("DMARC_BULK_MAX_EMAILS", "5000"))
 
 
 def _dmarc_txt_lookup(domain):
-    """Fetch the raw _dmarc.<domain> TXT record. Returns (record_string, error)."""
     if not HAS_DNSPYTHON:
         return None, "dnspython is not installed on the server."
     if not _DNS_RESOLVER:
@@ -2269,7 +2316,6 @@ def _dmarc_txt_lookup(domain):
 
 
 def _parse_dmarc_record(record):
-    """Parse 'v=DMARC1; p=reject; rua=...' into an ordered dict."""
     parsed = {}
     if not record:
         return parsed
@@ -2283,7 +2329,6 @@ def _parse_dmarc_record(record):
 
 
 def _dmarc_health(parsed):
-    """Return (verdict, issues_list). verdict is 'PASS', 'WARN', or 'FAIL'."""
     issues = []
     verdict = "PASS"
 
@@ -2398,16 +2443,12 @@ def dmarc_check_api():
 
 @app.post("/api/dmarc/bulk")
 def dmarc_bulk_api():
-    """Bulk DMARC filter.
-    Include an email if EITHER its domain's p= OR its effective sp= is 'none'.
-    (If sp= is absent, subdomains inherit p=.)"""
     data = request.get_json(silent=True) or {}
     raw = str(data.get("emails", ""))
 
     if not raw.strip():
         return jsonify(error="Paste at least one email address."), 400
 
-    # --- Parse + dedupe emails ---
     seen = set()
     emails = []
     for chunk in raw.replace(",", "\n").replace(";", "\n").splitlines():
@@ -2428,7 +2469,6 @@ def dmarc_bulk_api():
         return jsonify(error="Maximum " + str(DMARC_BULK_MAX_EMAILS) +
                        " emails per check. You pasted " + str(len(emails)) + "."), 400
 
-    # --- Unique domains ---
     domain_to_emails = {}
     for e in emails:
         local, _, dom = e.partition("@")
@@ -2440,7 +2480,6 @@ def dmarc_bulk_api():
     if not domain_to_emails:
         return jsonify(error="No valid domains found in the email list."), 400
 
-    # --- Parallel DMARC lookup per unique domain ---
     def _probe(dom):
         record, err = _dmarc_txt_lookup(dom)
         parsed = _parse_dmarc_record(record) if record else {}
@@ -2459,7 +2498,6 @@ def dmarc_bulk_api():
                 eff_sp = sp_raw
                 sp_explicit = True
             else:
-                # sp= absent or invalid → inherits p=
                 eff_sp = eff_p
                 sp_explicit = False
             has_record = True
@@ -2483,7 +2521,6 @@ def dmarc_bulk_api():
                     "p": "none", "sp": "none", "sp_explicit": False,
                 }
 
-    # --- Split ---
     no_dmarc_emails = []
     protected_emails = []
     domain_rows = []
@@ -2492,7 +2529,6 @@ def dmarc_bulk_api():
         eff_p = info.get("p", "none")
         eff_sp = info.get("sp", "none")
 
-        # Weak if EITHER domain policy OR subdomain policy is "none"
         is_weak = (eff_p == "none") or (eff_sp == "none")
 
         if is_weak:
@@ -2642,18 +2678,39 @@ def blocklist_check_api():
 
 
 # ============================================================
-# Email Hunter API
+# Email Hunter API — single & bulk
 # ============================================================
 @app.post("/api/email-hunter/start")
 def email_hunter_start():
     if not HAS_HUNTER:
         return jsonify(error="Email Hunter deps missing. Run: pip install requests beautifulsoup4"), 500
     data = request.get_json(silent=True) or {}
-    url = str(data.get("url", "")).strip()
-    if not url:
-        return jsonify(error="URL is required"), 400
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
+    single = str(data.get("url", "")).strip()
+    bulk = str(data.get("urls", "")).strip()
+
+    raw_urls = []
+    if single:
+        raw_urls.append(single)
+    if bulk:
+        for line in bulk.replace(",", "\n").splitlines():
+            line = line.strip()
+            if line:
+                raw_urls.append(line)
+
+    if not raw_urls:
+        return jsonify(error="Enter at least one URL"), 400
+
+    # normalize + dedupe
+    normalized = []
+    seen = set()
+    for u in raw_urls:
+        if not u.startswith(("http://", "https://")):
+            u = "https://" + u
+        u = u.rstrip("/")
+        if u in seen:
+            continue
+        seen.add(u)
+        normalized.append(u)
 
     sid = secrets.token_urlsafe(12)
     _hunter_status[sid] = "running"
@@ -2661,9 +2718,49 @@ def email_hunter_start():
 
     def _run():
         try:
-            crawler = EmailHunterCrawler(url)
-            result = crawler.crawl()
-            _hunter_store[sid] = result
+            all_emails = set()
+            all_sources = {}
+            agg = {
+                "pages_visited": 0,
+                "contact_pages": 0,
+                "errors": 0,
+                "discovered": 0,
+                "visited": 0,
+                "status_codes": {},
+                "urls_crawled": 0,
+                "urls_total": len(normalized),
+            }
+            start_t = time.time()
+            for u in normalized:
+                _log(f"[HUNTER MULTI] start {u}")
+                try:
+                    crawler = EmailHunterCrawler(u)
+                    res = crawler.crawl()
+                    for e in res.get("emails", []):
+                        all_emails.add(e)
+                    for e, urls_list in res.get("email_sources", {}).items():
+                        all_sources.setdefault(e, set()).update(urls_list)
+                    s = res.get("stats", {})
+                    agg["pages_visited"] += s.get("pages_visited", 0)
+                    agg["contact_pages"] += s.get("contact_pages", 0)
+                    agg["errors"] += s.get("errors", 0)
+                    agg["discovered"] += s.get("discovered", 0)
+                    agg["visited"] += s.get("visited", 0)
+                    for k, v in s.get("status_codes", {}).items():
+                        agg["status_codes"][k] = agg["status_codes"].get(k, 0) + v
+                    agg["urls_crawled"] += 1
+                except Exception as ie:
+                    _log(f"[HUNTER MULTI-ERR] {u} :: {ie}")
+                    agg["errors"] += 1
+
+            agg["emails"] = len(all_emails)
+            agg["time_taken"] = round(time.time() - start_t, 2)
+            _hunter_store[sid] = {
+                "emails": sorted(all_emails),
+                "email_sources": {e: sorted(list(us)) for e, us in all_sources.items()},
+                "stats": agg,
+                "urls": normalized,
+            }
             _hunter_status[sid] = "completed"
         except Exception as e:
             _log(f"[HUNTER EXCEPTION] {type(e).__name__}: {e}")
