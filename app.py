@@ -2,6 +2,12 @@
 # Email journeys — Single-file Flask App (Neon Nexus Edition)
 # Session: 7 days | Theme: Neon Nexus
 # Includes: Converter, Generators, Blocklist, Email Hunter, DMARC Lookup
+#
+# Email Hunter uses 4-layer fetch with automatic fallback:
+#   1) curl_cffi  (real Chrome TLS fingerprint — Cloudflare bypass #1)
+#   2) cloudscraper
+#   3) requests with retry
+#   4) Playwright (real headless browser — worst-case fallback)
 # ============================================================
 from flask import Flask, request, jsonify, session, redirect, url_for, Response
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -31,6 +37,20 @@ try:
     HAS_CLOUDSCRAPER = True
 except ImportError:
     HAS_CLOUDSCRAPER = False
+
+# NEW: curl_cffi — real Chrome TLS fingerprint (best Cloudflare bypass)
+try:
+    from curl_cffi import requests as cffi_requests
+    HAS_CFFI = True
+except ImportError:
+    HAS_CFFI = False
+
+# NEW: Playwright — real headless browser fallback
+try:
+    from playwright.sync_api import sync_playwright
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET_123456789")
@@ -76,6 +96,7 @@ def healthz():
 
 # ============================================================
 # Email Hunter — memory-safe, nav-priority, 404-tolerant
+# 4-layer fetch: curl_cffi → cloudscraper → requests → playwright
 # ============================================================
 if HAS_HUNTER:
     HUNTER_MAX_TIME = 150
@@ -426,6 +447,34 @@ if HAS_HUNTER:
                 _log(f"[HUNTER READ-ERR] {url} :: {e}")
                 return None
 
+        def _fetch_playwright(self, url):
+            """Layer 4 — real headless browser. Worst case fallback."""
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-blink-features=AutomationControlled",
+                    ],
+                )
+                try:
+                    ctx = browser.new_context(
+                        user_agent=self._ua(),
+                        viewport={"width": 1366, "height": 768},
+                        locale="en-US",
+                    )
+                    page = ctx.new_page()
+                    page.goto(url, timeout=25000, wait_until="domcontentloaded")
+                    page.wait_for_timeout(2000)
+                    html = page.content()
+                    return html
+                finally:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+
         def _fetch(self, url):
             if not self._is_valid_url(url):
                 return None
@@ -441,12 +490,84 @@ if HAS_HUNTER:
                 "User-Agent": self._ua(),
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9,ro;q=0.8,de;q=0.7",
-                "Connection": "keep-alive",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
                 "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
                 "DNT": "1",
+                "Connection": "keep-alive",
             }
 
-            # 1) plain requests
+            # ============================================================
+            # LAYER 1: curl_cffi — real Chrome TLS fingerprint
+            # Best Cloudflare / WAF bypass. Returns 200 where requests gets 503.
+            # ============================================================
+            if HAS_CFFI:
+                try:
+                    r = cffi_requests.get(
+                        url,
+                        headers=headers,
+                        timeout=HUNTER_TIMEOUT,
+                        impersonate="chrome124",
+                        allow_redirects=True,
+                    )
+                    self.stats["status_codes"][str(r.status_code)] = \
+                        self.stats["status_codes"].get(str(r.status_code), 0) + 1
+                    ctype = (r.headers.get("Content-Type") or "").lower()
+
+                    if r.status_code in (200, 404):
+                        if ctype and not any(t in ctype for t in (
+                                "text/html", "text/plain", "application/xhtml",
+                                "application/xml", "text/xml")):
+                            _log(f"[HUNTER SKIP-CTYPE-CFFI] {ctype[:40]} {url}")
+                            return None
+                        text = r.text or ""
+                        if text:
+                            if r.status_code == 200:
+                                self.host_failures.pop(host, None)
+                            _log(f"[HUNTER OK-CFFI-{r.status_code}] len={len(text)} {url}")
+                            return text
+                        return None
+
+                    if r.status_code >= 400 and r.status_code != 404:
+                        self.host_failures[host] = self.host_failures.get(host, 0) + 1
+                    _log(f"[HUNTER CFFI-STATUS] {r.status_code} {url}")
+                except Exception as e:
+                    _log(f"[HUNTER CFFI-ERR] {url} :: {type(e).__name__}: {e}")
+
+            # ============================================================
+            # LAYER 2: cloudscraper
+            # ============================================================
+            if self.scraper is not None:
+                try:
+                    r = self.scraper.get(url, headers=headers, timeout=HUNTER_TIMEOUT,
+                                         allow_redirects=True, stream=True)
+                    ctype = (r.headers.get("Content-Type") or "").lower()
+                    if r.status_code in (200, 404):
+                        if ctype and not any(t in ctype for t in (
+                                "text/html", "text/plain", "application/xhtml",
+                                "application/xml", "text/xml")):
+                            try: r.close()
+                            except Exception: pass
+                            return None
+                        text = self._read_capped(r, url)
+                        try: r.close()
+                        except Exception: pass
+                        if text:
+                            if r.status_code == 200:
+                                self.host_failures.pop(host, None)
+                            _log(f"[HUNTER OK-CS-{r.status_code}] len={len(text)} {url}")
+                            return text
+                except Exception as e:
+                    _log(f"[HUNTER CS-ERR] {url} :: {type(e).__name__}: {e}")
+
+            # ============================================================
+            # LAYER 3: plain requests with retry (original behavior)
+            # ============================================================
             try:
                 r = self.session.get(url, headers=headers, timeout=HUNTER_TIMEOUT,
                                      allow_redirects=True, verify=False, stream=True)
@@ -491,29 +612,19 @@ if HAS_HUNTER:
                 self.host_failures[host] = self.host_failures.get(host, 0) + 1
                 _log(f"[HUNTER REQ-ERR] {url} :: {type(e).__name__}: {e}")
 
-            # 2) cloudscraper
-            if self.scraper is not None:
+            # ============================================================
+            # LAYER 4: Playwright — real headless browser (final fallback)
+            # Use only when 3 previous layers all failed. Heavier but bulletproof.
+            # ============================================================
+            if HAS_PLAYWRIGHT:
                 try:
-                    r = self.scraper.get(url, headers=headers, timeout=HUNTER_TIMEOUT,
-                                         allow_redirects=True, stream=True)
-                    ctype = (r.headers.get("Content-Type") or "").lower()
-                    if r.status_code in (200, 404):
-                        if ctype and not any(t in ctype for t in (
-                                "text/html", "text/plain", "application/xhtml",
-                                "application/xml", "text/xml")):
-                            try: r.close()
-                            except Exception: pass
-                            return None
-                        text = self._read_capped(r, url)
-                        try: r.close()
-                        except Exception: pass
-                        if text:
-                            if r.status_code == 200:
-                                self.host_failures.pop(host, None)
-                            _log(f"[HUNTER OK-CS-{r.status_code}] len={len(text)} {url}")
-                            return text
+                    text = self._fetch_playwright(url)
+                    if text:
+                        self.host_failures.pop(host, None)
+                        _log(f"[HUNTER OK-PW] len={len(text)} {url}")
+                        return text
                 except Exception as e:
-                    _log(f"[HUNTER CS-ERR] {url} :: {type(e).__name__}: {e}")
+                    _log(f"[HUNTER PW-ERR] {url} :: {type(e).__name__}: {e}")
 
             self.stats["errors"] += 1
             return None
@@ -590,7 +701,6 @@ if HAS_HUNTER:
             self.email_sources.setdefault(email, set()).add(page_url)
 
         def _process_html(self, html, url, is_start=False):
-            # 1) Extract emails from raw HTML first (before parsing)
             for e in hunter_extract_emails(html):
                 self._record_email(e, url)
 
@@ -600,14 +710,12 @@ if HAS_HUNTER:
             except Exception:
                 return
 
-            # 2) Extract mailto: emails
             for a in soup.find_all("a", href=True):
                 href = str(a["href"])
                 if href.lower().startswith("mailto:"):
                     e = href[7:].split("?")[0].strip().lower()
                     self._record_email(e, url)
 
-            # 3) HIGH priority: nav + footer links
             nav_links = self._extract_nav_footer_links(soup, url)
             if nav_links:
                 self.stats["nav_pages"] = self.stats.get("nav_pages", 0) + 1
@@ -617,11 +725,9 @@ if HAS_HUNTER:
                     self._enqueue_nav(nav_links)
                 _log(f"[HUNTER NAV] {len(nav_links)} nav/footer links on {url}")
 
-            # 4) Medium: everything else
             other_links = self._extract_links(soup, url)
             self._enqueue_many(other_links)
 
-            # 5) Free memory
             try:
                 soup.decompose()
             except Exception:
@@ -636,7 +742,6 @@ if HAS_HUNTER:
             _log(f"[HUNTER START] {self.start_url} (base={self.base_domain})")
             _log("=" * 60)
 
-            # 1) Start page first
             start_html = self._fetch(self.start_url)
             if start_html:
                 self.visited.add(self.start_url)
@@ -645,7 +750,6 @@ if HAS_HUNTER:
                 self._process_html(start_html, self.start_url, is_start=True)
                 start_html = None
 
-            # 2) Sitemap
             for sm in self._discover_sitemaps():
                 for u in self._parse_sitemap(sm):
                     if self._is_valid_url(u) and self._is_internal(u) \
@@ -655,7 +759,6 @@ if HAS_HUNTER:
                         self.queue.append(u)
                         self.stats["discovered"] += 1
 
-            # 3) Guess paths
             for path in HUNTER_GUESS_PATHS:
                 if len(self.queue) >= HUNTER_MAX_QUEUE:
                     break
@@ -667,7 +770,6 @@ if HAS_HUNTER:
 
             _log(f"[HUNTER QUEUE] initial={len(self.queue)}")
 
-            # 4) Main loop
             while self.queue and (time.time() - self.start_time) < HUNTER_MAX_TIME:
                 url = self.queue.popleft()
                 if url in self.visited:
@@ -879,11 +981,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
 .toast.ok{border-color:color-mix(in srgb,var(--ok) 50%,transparent);color:var(--ok)}
 .toast.err{border-color:color-mix(in srgb,var(--danger) 50%,transparent);color:var(--danger)}
 @keyframes toastIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
-.hunter-email-cell{font-family:'JetBrains Mono',monospace;font-size:11.5px;font-weight:600;color:var(--text);word-break:break-all}
-.hunter-domain-cell{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);word-break:break-all}
-.hunter-pages-cell{font-size:11px;text-align:left}
-.hunter-pages-cell a{color:var(--cyan);text-decoration:none;display:block;margin:3px 0;word-break:break-all}
-.hunter-pages-cell a:hover{text-decoration:underline}
+.hunter-email-cell{font-family:'JetBrains Mono',monospace;font-size:12.5px;font-weight:600;color:var(--text);word-break:break-all;text-align:left;padding:12px 16px!important}
 @media(max-width:980px){.home-wrap{grid-template-columns:1fr}.feature-grid{grid-template-columns:1fr 1fr}.feat,.feat.wide{grid-column:span 1}.feat.wide{grid-column:span 2}.quick-stats{grid-template-columns:repeat(2,1fr)}.workspace,.controls3{grid-template-columns:1fr}.bl-form{grid-template-columns:1fr}.bl-summary{grid-template-columns:repeat(3,1fr)}}@media(max-width:640px){.app{padding:14px 14px 0}.topbar{position:static}.nav{width:100%}.nav button{flex:1 1 auto}.feature-grid{grid-template-columns:1fr}.feat,.feat.wide{grid-column:auto}.quick-stats{grid-template-columns:repeat(2,1fr)}.bl-summary{grid-template-columns:repeat(2,1fr)}.output-wrap{flex-direction:column}.copy-btn{padding:11px;width:100%}}
 </style>
 </head>
@@ -901,7 +999,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
         <path d="M32 5 55 18v28L32 59 9 46V18z" fill="none" stroke="url(#lg)" stroke-width="3.5" stroke-linejoin="round"/>
         <text x="32" y="40" text-anchor="middle" font-family="Space Grotesk,sans-serif" font-size="19" font-weight="700" fill="url(#lg)">EJ</text>
       </svg>
-      <div><b>Email journeys</b><span>NEON NEXUS · V12</span></div>
+      <div><b>Email journeys</b><span>NEON NEXUS · V13</span></div>
     </div>
     <nav class="nav">
       <button id="nav-home" onclick="showPage('home')">Home</button>
@@ -932,11 +1030,11 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
         <div class="terminal">
           <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><b>~ email-journeys --live</b></div>
           <div class="term-body">
-            <div class="term-line"><span class="term-prompt">$</span><span class="term-out">hunter crawl --single --bulk --memory-safe</span></div>
+            <div class="term-line"><span class="term-prompt">$</span><span class="term-out">hunter crawl --single --bulk --4-layer-fetch</span></div>
             <div class="term-line"><span class="term-prompt">$</span><span class="term-out">dmarc check --p --sp --filter=none</span></div>
-            <div class="term-line"><span class="term-prompt">→</span><span class="term-out cyan">2 MB cap · streaming read</span></div>
+            <div class="term-line"><span class="term-prompt">→</span><span class="term-out cyan">curl_cffi · cloudscraper · requests · playwright</span></div>
             <div class="term-line"><span class="term-prompt">→</span><span class="term-out lime">header · nav · footer first</span></div>
-            <div class="term-line"><span class="term-prompt">→</span><span class="term-out magenta">email + domain + source page</span></div>
+            <div class="term-line"><span class="term-prompt">→</span><span class="term-out magenta">email list only — clean output</span></div>
             <div class="term-line"><span class="term-prompt">✓</span><span class="term-out lime">ready</span><span class="term-cursor"></span></div>
           </div>
         </div>
@@ -944,7 +1042,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
     </div>
     <div class="quick-stats">
       <div class="qs-card"><span class="qs-num">3</span><span class="qs-lbl">Q Encoders</span></div>
-      <div class="qs-card"><span class="qs-num">4</span><span class="qs-lbl">DNSBL Zones</span></div>
+      <div class="qs-card"><span class="qs-num">4</span><span class="qs-lbl">Fetch Layers</span></div>
       <div class="qs-card"><span class="qs-num">p+sp</span><span class="qs-lbl">DMARC Policies</span></div>
       <div class="qs-card"><span class="qs-num">7d</span><span class="qs-lbl">Session</span></div>
     </div>
@@ -975,9 +1073,9 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
       </div>
       <div class="feat f-cyan wide" onclick="showPage('hunter')">
         <div class="feat-glow"></div><div class="feat-inner">
-        <span class="feat-tag">05 / HUNT · MEMORY-SAFE · NAV-PRIORITY</span>
+        <span class="feat-tag">05 / HUNT · 4-LAYER FETCH · CLOUDFLARE BYPASS</span>
         <h3>Email Hunter — Memory-Safe Crawler</h3>
-        <p>Crawls one website or a bulk list. <b>Streams responses with a 2 MB cap</b>, skips huge pages, and extracts header/nav/footer links first (Work &amp; Travel, Joburi, Servicii, Despre, …). Each email shows its <b>domain</b> and <b>source page URL(s)</b>. Handles 404 pages gracefully.</p></div>
+        <p>Crawls one website or a bulk list with a <b>4-layer fetch stack</b>: curl_cffi (real Chrome TLS fingerprint) → cloudscraper → requests → <b>Playwright real browser</b>. Bypasses Cloudflare, WAF, 503/403, bot blocks. Extracts header/nav/footer links first. Shows a clean <b>email list only</b>. Handles 404 pages gracefully.</p></div>
       </div>
       <div class="feat f-magenta wide" onclick="showPage('dmarc')">
         <div class="feat-glow"></div><div class="feat-inner">
@@ -1123,7 +1221,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
     <div class="section-head">
       <div>
         <h2>Email <span class="accent">Hunter</span></h2>
-        <p>Crawl a single website or a bulk URL list. Extracts <b>header/nav/footer links first</b> (Work &amp; Travel, Joburi, Servicii, Despre, …) then crawls those pages for publicly available emails — each shown with its <b>domain</b> and <b>source page URL(s)</b>.</p>
+        <p>Crawl a single website or a bulk URL list with <b>4-layer fetch</b> (curl_cffi → cloudscraper → requests → Playwright). Bypasses Cloudflare, WAF, 503/403, bot blocks. Extracts <b>header/nav/footer links first</b>, then crawls those pages for publicly available emails. <b>Output: clean email list.</b></p>
       </div>
     </div>
 
@@ -1169,15 +1267,13 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
       <h3>Emails Found (<span id="hunter-count">0</span>)</h3>
       <div class="actions" style="margin-top:0;margin-bottom:12px">
         <button class="secondary" onclick="copyHunterEmails(this)">Copy Emails</button>
-        <button class="secondary" onclick="exportHunterCsv()">Export CSV (Email, Domain, Pages)</button>
+        <button class="secondary" onclick="exportHunterCsv()">Export CSV</button>
       </div>
       <div class="bl-table-wrap" style="max-height:620px">
-        <table class="bl-table" style="min-width:900px">
+        <table class="bl-table" style="min-width:auto">
           <thead>
             <tr>
-              <th style="text-align:left;width:24%">Email</th>
-              <th style="text-align:left;width:18%">Domain</th>
-              <th style="text-align:left">Source Pages</th>
+              <th style="text-align:left">Email</th>
             </tr>
           </thead>
           <tbody id="hunter-emails-tbody"></tbody>
@@ -1609,26 +1705,14 @@ function displayHunterResults(d, isBulk) {
   stats.classList.remove('hidden');
 
   const emails = d.emails || [];
-  const sources = d.email_sources || {};
   $('hunter-count').textContent = emails.length;
 
   const tbody = $('hunter-emails-tbody');
   if (!emails.length) {
-    tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:var(--muted);padding:24px">No emails found.</td></tr>';
+    tbody.innerHTML = '<tr><td style="text-align:center;color:var(--muted);padding:24px">No emails found.</td></tr>';
   } else {
     tbody.innerHTML = emails.map(function (e) {
-      const domain = (e.split('@')[1] || '');
-      const urls = sources[e] || [];
-      const urlsHtml = urls.length
-        ? urls.map(function (u) {
-            return '<a href="' + esc(u) + '" target="_blank" rel="noopener">' + esc(u) + '</a>';
-          }).join('')
-        : '<span style="color:var(--muted)">—</span>';
-      return '<tr>' +
-        '<td class="hunter-email-cell">' + esc(e) + '</td>' +
-        '<td class="hunter-domain-cell">' + esc(domain) + '</td>' +
-        '<td class="hunter-pages-cell">' + urlsHtml + '</td>' +
-        '</tr>';
+      return '<tr><td class="hunter-email-cell">' + esc(e) + '</td></tr>';
     }).join('');
   }
   $('hunter-emails-card').style.display = 'block';
@@ -1674,17 +1758,7 @@ async function copyHunterEmails(btn) {
 
 function exportHunterCsv() {
   if (!hunterState.data || !hunterState.data.emails) { toast('Nothing to export', 'err'); return; }
-  const sources = hunterState.data.email_sources || {};
-  const lines = ['Email,Domain,Pages'];
-  hunterState.data.emails.forEach(function (e) {
-    const domain = e.split('@')[1] || '';
-    const urls = (sources[e] || []).join(' | ');
-    const row = [e, domain, urls].map(function (v) {
-      const s = String(v === null || v === undefined ? '' : v);
-      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-    }).join(',');
-    lines.push(row);
-  });
+  const lines = ['Email'].concat(hunterState.data.emails);
   const blob = new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob); const a = document.createElement('a');
   a.href = url; a.download = 'emails-hunted.csv';
@@ -2820,7 +2894,7 @@ def blocklist_check_api():
 
 
 # ============================================================
-# Email Hunter API — single & bulk, memory-safe
+# Email Hunter API — single & bulk, memory-safe, 4-layer fetch
 # ============================================================
 @app.post("/api/email-hunter/start")
 def email_hunter_start():
