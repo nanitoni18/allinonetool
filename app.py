@@ -1160,10 +1160,10 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
     </div>
     <div id="gen-word" class="card gen-panel hidden">
       <h3>Random Words Generator</h3>
-      <p class="helper">Pronounceable consonant–vowel patterns.</p>
+      <p class="helper">Styled word blends: real words + pronounceable chunks joined with <code>-</code>, <code>_</code>, <code>.</code>. Random in-between letters use <code>-</code> or <code>+</code>. Trailing number appended. Example: <code>f-ierce_ga.lax-strong_me.ado-warm_rain.68</code></p>
       <div class="controls3">
-        <div><label class="label" for="wordMin">Min length</label><input id="wordMin" type="number" value="8" min="1" max="10000"></div>
-        <div><label class="label" for="wordMax">Max length</label><input id="wordMax" type="number" value="20" min="1" max="10000"></div>
+        <div><label class="label" for="wordMin">Min chunk length</label><input id="wordMin" type="number" value="2" min="1" max="10000"></div>
+        <div><label class="label" for="wordMax">Max chunk length</label><input id="wordMax" type="number" value="6" min="1" max="10000"></div>
         <div><label class="label" for="wordCount">Results</label><input id="wordCount" type="number" value="10" min="1" max="1000"></div>
       </div>
       <div class="actions">
@@ -1522,7 +1522,7 @@ async function generateWords() {
   const count = Math.max(1, Math.min(parseInt($('wordCount').value, 10) || 10, 1000));
   try {
     const d = await api('/api/random/data', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kind: 'words', min: range[0], max: range[1], count: count }) });
-    $('wordOut').value = d.results.join('\n'); $('wordStatus').textContent = d.results.length + ' random words generated';
+    $('wordOut').value = d.results.join('\n'); $('wordStatus').textContent = d.results.length + ' styled words generated';
   } catch (e) { $('wordStatus').textContent = e.message; toast(e.message, 'err'); }
 }
 async function generateNames() {
@@ -2250,6 +2250,68 @@ def _generate_word(min_len, max_len):
         con = not con
     return w[:n]
 
+
+# Real English words mixed into styled generator output
+REAL_WORDS = [
+    "fierce", "strong", "warm", "rain", "fire", "stone", "wind", "iron",
+    "storm", "cloud", "silver", "golden", "shadow", "light", "dark", "bright",
+    "swift", "wild", "calm", "brave", "bold", "sharp", "soft", "cold",
+    "wave", "star", "moon", "sun", "sky", "leaf", "river", "ocean",
+    "mountain", "forest", "night", "dawn", "dusk", "spark", "flame", "frost",
+    "me", "you", "we", "us", "ado", "pro", "max", "neo", "zen", "arc",
+    "fast", "slow", "high", "low", "deep", "pure", "real", "true", "free",
+    "ever", "never", "always", "today", "tomorrow", "dream", "hope", "fear",
+    "joy", "pain", "love", "hate", "peace", "war", "life", "death",
+]
+
+
+def _styled_word(min_len=2, max_len=6):
+    """
+    Generate output like:
+      f-ierce_ga.lax-strong_me.ado-warm_rain.68
+      st+rong_wind.75
+      me.ado-f-ierce_rain_glow.8921
+
+    Structure:
+      - 4-6 word-like segments (real words + pronounceable chunks)
+      - Join with random separators: '-' '_' '.'
+      - Random single letters injected inside words using '+' or '-'
+      - Random 2-4 digit number at the end
+    """
+    n_segments = random.randint(4, 6)
+    segments = []
+
+    for _ in range(n_segments):
+        # Real word OR pronounceable chunk
+        if random.random() < 0.55:
+            w = random.choice(REAL_WORDS)
+        else:
+            w = _generate_word(min_len, max_len).lower()
+
+        # Inject a single letter inside using '+' or '-' (in-between letter)
+        if len(w) >= 4 and random.random() < 0.40:
+            pos = random.randint(1, len(w) - 1)
+            letter = random.choice(string.ascii_lowercase)
+            sep = random.choice(["-", "+"])
+            w = w[:pos] + sep + letter + w[pos:]
+
+        # Sometimes append a random single letter with '-' or '+' as its own tail
+        elif random.random() < 0.25:
+            w = w + random.choice(["-", "+"]) + random.choice(string.ascii_lowercase)
+
+        segments.append(w)
+
+    # Join segments with random separators
+    separators = ["-", "_", "."]
+    result = segments[0]
+    for seg in segments[1:]:
+        result += random.choice(separators) + seg
+
+    # Append random number at end
+    result += "." + str(random.randint(10, 9999))
+    return result
+
+
 @app.post("/api/random/data")
 def random_data_api():
     data = request.get_json(silent=True) or {}
@@ -2266,9 +2328,9 @@ def random_data_api():
         ])
     if kind == "words":
         results, used, attempts = [], set(), 0
-        while len(results) < count and attempts < count * 30:
+        while len(results) < count and attempts < count * 40:
             attempts += 1
-            w = _generate_word(min_len, max_len).capitalize()
+            w = _styled_word(min_len, max_len)
             if w not in used:
                 used.add(w); results.append(w)
         return jsonify(results=results)
