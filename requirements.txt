@@ -4,7 +4,6 @@ requests
 beautifulsoup4
 dnspython
 keep_alive_ping
-# Optional (Email Hunter fallback layers)
 curl_cffi
 cloudscraper
 playwright
