@@ -8,12 +8,6 @@
 #   2) cloudscraper
 #   3) requests with retry
 #   4) Playwright (real headless browser — worst-case fallback)
-#
-# HUNTER ADD-ONS (V14):
-#   • Advanced filters: free providers, role accounts, blocklist, whitelist, pattern
-#   • MX validation (drops dead domains)
-#   • Quick Extract — single page, no crawl
-#   • Paste HTML — extract from raw HTML without any network call
 # ============================================================
 from flask import Flask, request, jsonify, session, redirect, url_for, Response
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -44,12 +38,14 @@ try:
 except ImportError:
     HAS_CLOUDSCRAPER = False
 
+# NEW: curl_cffi — real Chrome TLS fingerprint (best Cloudflare bypass)
 try:
     from curl_cffi import requests as cffi_requests
     HAS_CFFI = True
 except ImportError:
     HAS_CFFI = False
 
+# NEW: Playwright — real headless browser fallback
 try:
     from playwright.sync_api import sync_playwright
     HAS_PLAYWRIGHT = True
@@ -229,172 +225,6 @@ if HAS_HUNTER:
             e = f"{local}@{mid}.{tld}".lower()
             if _is_valid_email(e):
                 found.add(e)
-        return found
-
-    # ============================================================
-    # Email filtering + MX validation helpers (V14 add-on)
-    # ============================================================
-    FREE_EMAIL_DOMAINS = {
-        "gmail.com","googlemail.com","yahoo.com","yahoo.co.uk","yahoo.fr","yahoo.de",
-        "yahoo.es","yahoo.it","yahoo.ca","yahoo.com.au","yahoo.co.in","ymail.com",
-        "rocketmail.com","outlook.com","outlook.fr","outlook.de","hotmail.com",
-        "hotmail.co.uk","hotmail.fr","hotmail.de","hotmail.it","live.com","live.co.uk",
-        "msn.com","aol.com","aol.co.uk","icloud.com","me.com","mac.com","protonmail.com",
-        "proton.me","pm.me","tutanota.com","tuta.io","gmx.com","gmx.de","gmx.net",
-        "mail.com","mail.ru","yandex.com","yandex.ru","zoho.com","fastmail.com",
-        "hushmail.com","inbox.com","rediffmail.com","163.com","126.com","qq.com",
-        "naver.com","daum.net","hanmail.net","web.de","t-online.de","freenet.de",
-    }
-
-    ROLE_LOCAL_PARTS = {
-        "info","contact","support","admin","administrator","noreply","no-reply",
-        "donotreply","do-not-reply","postmaster","webmaster","hostmaster","abuse",
-        "sales","marketing","hr","jobs","careers","billing","accounts","help",
-        "helpdesk","office","mail","email","team","enquiries","inquiries",
-        "feedback","hello","hi","general","newsletter","press","media","privacy",
-        "security","legal","compliance","it","tech","dev","developer","api",
-        "bounce","notifications","alerts","system","root","daemon",
-    }
-
-    def apply_email_filters(emails, opts):
-        """Apply filter options to a list of emails.
-        opts keys: exclude_free, exclude_roles, blocklist[], whitelist[], pattern
-        Returns: (kept_list, dropped_dict)
-        """
-        opts = opts or {}
-        exclude_free  = bool(opts.get("exclude_free"))
-        exclude_roles = bool(opts.get("exclude_roles"))
-        blocklist     = {x.strip().lower() for x in (opts.get("blocklist") or []) if x.strip()}
-        whitelist     = {x.strip().lower() for x in (opts.get("whitelist") or []) if x.strip()}
-        pattern       = (opts.get("pattern") or "").strip().lower()
-
-        pat_re = None
-        if pattern:
-            import fnmatch as _fnmatch_h
-            pat_re = _re_h.compile(_fnmatch_h.translate(pattern))
-
-        kept = []
-        dropped = {"free": 0, "role": 0, "block": 0, "not_white": 0, "pattern": 0}
-
-        for e in emails:
-            if not e or "@" not in e:
-                continue
-            e_low = e.lower()
-            local, _, dom = e_low.partition("@")
-
-            if whitelist:
-                ok = dom in whitelist or any(dom.endswith("." + w) for w in whitelist)
-                if not ok:
-                    dropped["not_white"] += 1
-                    continue
-
-            if exclude_free and dom in FREE_EMAIL_DOMAINS:
-                dropped["free"] += 1
-                continue
-
-            if exclude_roles and local in ROLE_LOCAL_PARTS:
-                dropped["role"] += 1
-                continue
-
-            if blocklist:
-                hit = (e_low in blocklist
-                       or dom in blocklist
-                       or any(dom.endswith("." + b) for b in blocklist))
-                if hit:
-                    dropped["block"] += 1
-                    continue
-
-            if pat_re and not pat_re.match(e_low):
-                dropped["pattern"] += 1
-                continue
-
-            kept.append(e)
-
-        return kept, dropped
-
-    _MX_CACHE = {}
-    _MX_CACHE_LOCK = threading.Lock()
-
-    def has_mx(domain):
-        """Return True if domain has MX (or A as RFC 5321 fallback)."""
-        if not domain:
-            return False
-        with _MX_CACHE_LOCK:
-            if domain in _MX_CACHE:
-                return _MX_CACHE[domain]
-
-        result = False
-        if USE_DNSPYTHON:
-            try:
-                ans = _DNS_RESOLVER.resolve(domain, "MX", raise_on_no_answer=False, lifetime=DNS_LIFETIME)
-                if getattr(ans, "rrset", None):
-                    result = True
-            except Exception:
-                pass
-            if not result:
-                try:
-                    ans = _DNS_RESOLVER.resolve(domain, "A", raise_on_no_answer=False, lifetime=DNS_LIFETIME)
-                    if getattr(ans, "rrset", None):
-                        result = True
-                except Exception:
-                    pass
-        else:
-            try:
-                socket.getaddrinfo(domain, None)
-                result = True
-            except Exception:
-                result = False
-
-        with _MX_CACHE_LOCK:
-            _MX_CACHE[domain] = result
-        return result
-
-    def filter_mx(emails):
-        """Split emails into (alive, dead) based on MX existence. Parallel."""
-        if not emails:
-            return emails, []
-        domain_to_emails = {}
-        for e in emails:
-            try:
-                d = e.split("@", 1)[1]
-            except Exception:
-                continue
-            domain_to_emails.setdefault(d, []).append(e)
-
-        bad_domains = set()
-        try:
-            with ThreadPoolExecutor(max_workers=min(16, max(1, len(domain_to_emails)))) as ex:
-                futures = {ex.submit(has_mx, d): d for d in domain_to_emails}
-                for fut in as_completed(futures):
-                    d = futures[fut]
-                    try:
-                        if not fut.result():
-                            bad_domains.add(d)
-                    except Exception:
-                        bad_domains.add(d)
-        except Exception:
-            pass
-
-        if not bad_domains:
-            return emails, []
-        alive = [e for e in emails if e.split("@", 1)[1] not in bad_domains]
-        dead  = [e for e in emails if e.split("@", 1)[1] in bad_domains]
-        return alive, dead
-
-    def extract_from_html_blob(html):
-        """Shared: extract emails from raw HTML (regex + mailto:)."""
-        found = hunter_extract_emails(html) if html else set()
-        try:
-            soup = BeautifulSoup(html, "html.parser")
-            for a in soup.find_all("a", href=True):
-                href = str(a["href"])
-                if href.lower().startswith("mailto:"):
-                    e = href[7:].split("?")[0].strip().lower()
-                    if _is_valid_email(e):
-                        found.add(e)
-            soup.decompose()
-        except Exception:
-            pass
         return found
 
     class EmailHunterCrawler:
@@ -674,6 +504,7 @@ if HAS_HUNTER:
 
             # ============================================================
             # LAYER 1: curl_cffi — real Chrome TLS fingerprint
+            # Best Cloudflare / WAF bypass. Returns 200 where requests gets 503.
             # ============================================================
             if HAS_CFFI:
                 try:
@@ -783,6 +614,7 @@ if HAS_HUNTER:
 
             # ============================================================
             # LAYER 4: Playwright — real headless browser (final fallback)
+            # Use only when 3 previous layers all failed. Heavier but bulletproof.
             # ============================================================
             if HAS_PLAYWRIGHT:
                 try:
@@ -1167,7 +999,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
         <path d="M32 5 55 18v28L32 59 9 46V18z" fill="none" stroke="url(#lg)" stroke-width="3.5" stroke-linejoin="round"/>
         <text x="32" y="40" text-anchor="middle" font-family="Space Grotesk,sans-serif" font-size="19" font-weight="700" fill="url(#lg)">EJ</text>
       </svg>
-      <div><b>Email journeys</b><span>NEON NEXUS · V14</span></div>
+      <div><b>Email journeys</b><span>NEON NEXUS · V13</span></div>
     </div>
     <nav class="nav">
       <button id="nav-home" onclick="showPage('home')">Home</button>
@@ -1199,20 +1031,19 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
           <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><b>~ email-journeys --live</b></div>
           <div class="term-body">
             <div class="term-line"><span class="term-prompt">$</span><span class="term-out">hunter crawl --single --bulk --4-layer-fetch</span></div>
-            <div class="term-line"><span class="term-prompt">$</span><span class="term-out">hunter quick --single-page --no-crawl</span></div>
-            <div class="term-line"><span class="term-prompt">$</span><span class="term-out">hunter paste --html --no-network</span></div>
             <div class="term-line"><span class="term-prompt">$</span><span class="term-out">dmarc check --p --sp --filter=none</span></div>
             <div class="term-line"><span class="term-prompt">→</span><span class="term-out cyan">curl_cffi · cloudscraper · requests · playwright</span></div>
-            <div class="term-line"><span class="term-prompt">→</span><span class="term-out lime">filter: free · role · block · white · mx</span></div>
+            <div class="term-line"><span class="term-prompt">→</span><span class="term-out lime">header · nav · footer first</span></div>
+            <div class="term-line"><span class="term-prompt">→</span><span class="term-out magenta">email list only — clean output</span></div>
             <div class="term-line"><span class="term-prompt">✓</span><span class="term-out lime">ready</span><span class="term-cursor"></span></div>
           </div>
         </div>
       </div>
     </div>
     <div class="quick-stats">
-      <div class="qs-card"><span class="qs-num">4</span><span class="qs-lbl">Hunter Modes</span></div>
+      <div class="qs-card"><span class="qs-num">3</span><span class="qs-lbl">Q Encoders</span></div>
       <div class="qs-card"><span class="qs-num">4</span><span class="qs-lbl">Fetch Layers</span></div>
-      <div class="qs-card"><span class="qs-num">5</span><span class="qs-lbl">Filters</span></div>
+      <div class="qs-card"><span class="qs-num">p+sp</span><span class="qs-lbl">DMARC Policies</span></div>
       <div class="qs-card"><span class="qs-num">7d</span><span class="qs-lbl">Session</span></div>
     </div>
     <div class="feature-grid">
@@ -1242,9 +1073,9 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
       </div>
       <div class="feat f-cyan wide" onclick="showPage('hunter')">
         <div class="feat-glow"></div><div class="feat-inner">
-        <span class="feat-tag">05 / HUNT · 4 MODES · 4-LAYER FETCH · FILTERS + MX</span>
-        <h3>Email Hunter — Crawl · Quick · Paste · Filter</h3>
-        <p>Four modes in one tool: <b>Single URL</b> crawl, <b>Bulk URL</b> crawl, <b>Quick Extract</b> (single page, no crawl), and <b>Paste HTML</b> (no network). 4-layer fetch stack bypasses Cloudflare / WAF. Filter results by <b>free providers</b>, <b>role accounts</b>, <b>blocklist</b>, <b>whitelist</b>, <b>glob pattern</b>, plus optional <b>MX validation</b> that drops dead domains.</p></div>
+        <span class="feat-tag">05 / HUNT · 4-LAYER FETCH · CLOUDFLARE BYPASS</span>
+        <h3>Email Hunter — Memory-Safe Crawler</h3>
+        <p>Crawls one website or a bulk list with a <b>4-layer fetch stack</b>: curl_cffi (real Chrome TLS fingerprint) → cloudscraper → requests → <b>Playwright real browser</b>. Bypasses Cloudflare, WAF, 503/403, bot blocks. Extracts header/nav/footer links first. Shows a clean <b>email list only</b>. Handles 404 pages gracefully.</p></div>
       </div>
       <div class="feat f-magenta wide" onclick="showPage('dmarc')">
         <div class="feat-glow"></div><div class="feat-inner">
@@ -1390,44 +1221,13 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
     <div class="section-head">
       <div>
         <h2>Email <span class="accent">Hunter</span></h2>
-        <p>Crawl one site or a bulk list with <b>4-layer fetch</b> (curl_cffi → cloudscraper → requests → Playwright). Or run a <b>Quick Extract</b> on a single page, or just <b>Paste HTML</b>. Filter results by free-provider, role-account, blocklist, whitelist, pattern, and MX validity.</p>
+        <p>Crawl a single website or a bulk URL list with <b>4-layer fetch</b> (curl_cffi → cloudscraper → requests → Playwright). Bypasses Cloudflare, WAF, 503/403, bot blocks. Extracts <b>header/nav/footer links first</b>, then crawls those pages for publicly available emails. <b>Output: clean email list.</b></p>
       </div>
     </div>
 
-    <div class="tabs" style="flex-wrap:wrap">
-      <button id="hunter-single-tab" class="tab active" onclick="hunterTab('single')">Single URL</button>
-      <button id="hunter-bulk-tab" class="tab" onclick="hunterTab('bulk')">Bulk URLs</button>
-      <button id="hunter-quick-tab" class="tab" onclick="hunterTab('quick')">Quick Extract</button>
-      <button id="hunter-paste-tab" class="tab" onclick="hunterTab('paste')">Paste HTML</button>
-    </div>
-
-    <div class="card" style="margin-bottom:18px">
-      <h3 style="margin-bottom:12px">Filters <span style="color:var(--muted);font-weight:400;font-size:12px">(applied to Single / Bulk / Quick / Paste)</span></h3>
-      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:14px">
-        <label class="check" style="display:flex;gap:8px;align-items:center;cursor:pointer;font-size:13px;color:var(--text-soft)">
-          <input type="checkbox" id="hf-exclude-free"> Exclude free providers
-        </label>
-        <label class="check" style="display:flex;gap:8px;align-items:center;cursor:pointer;font-size:13px;color:var(--text-soft)">
-          <input type="checkbox" id="hf-exclude-roles"> Exclude role accounts
-        </label>
-        <label class="check" style="display:flex;gap:8px;align-items:center;cursor:pointer;font-size:13px;color:var(--text-soft)">
-          <input type="checkbox" id="hf-mx-check"> MX check (drop dead domains)
-        </label>
-      </div>
-      <div class="workspace" style="gap:14px">
-        <div>
-          <label class="label" for="hf-blocklist">Blocklist (domains or full emails)</label>
-          <textarea id="hf-blocklist" placeholder="spam.com&#10;example.org&#10;bad@company.com" style="min-height:80px;font-size:12px"></textarea>
-        </div>
-        <div>
-          <label class="label" for="hf-whitelist">Whitelist (keep only these domains)</label>
-          <textarea id="hf-whitelist" placeholder="company.com&#10;agency.io" style="min-height:80px;font-size:12px"></textarea>
-        </div>
-      </div>
-      <div style="margin-top:12px">
-        <label class="label" for="hf-pattern">Pattern (glob — e.g. *@company.com)</label>
-        <input id="hf-pattern" type="text" placeholder="*@company.com" spellcheck="false">
-      </div>
+    <div class="tabs">
+      <button id="hunter-single-tab" class="tab active" onclick="hunterTab('single')">Single Website URL</button>
+      <button id="hunter-bulk-tab" class="tab" onclick="hunterTab('bulk')">Bulk Website URLs</button>
     </div>
 
     <div id="hunter-single-panel">
@@ -1461,40 +1261,10 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
       </div>
     </div>
 
-    <div id="hunter-quick-panel" class="hidden">
-      <div class="card">
-        <label class="label" for="hunter-quick-url">Single page URL — fetch this page only, no crawling</label>
-        <div style="display:flex;gap:10px;flex-wrap:wrap">
-          <input id="hunter-quick-url" type="text" placeholder="https://example.com/contact" autocomplete="off" spellcheck="false" style="flex:1;min-width:240px">
-          <button class="primary" id="hunter-quick-btn" onclick="startQuickExtract()">Quick Extract</button>
-          <button class="secondary" id="hunter-quick-cancel" onclick="cancelEmailHunter()" disabled>Cancel</button>
-        </div>
-        <p class="helper" style="margin-top:10px">Fetches just this one URL through the 4-layer stack and extracts emails. No navigation, no queue — fastest option.</p>
-        <div id="hunter-quick-status" class="status" style="margin-top:14px"></div>
-        <div class="bl-progress hidden" id="hunter-quick-progress" style="margin-top:6px">
-          <div class="bl-progress-bar" id="hunter-quick-progress-bar" style="width:8%"></div>
-        </div>
-      </div>
-    </div>
-
-    <div id="hunter-paste-panel" class="hidden">
-      <div class="card">
-        <label class="label" for="hunter-paste-html">Paste raw HTML / page source</label>
-        <textarea id="hunter-paste-html" placeholder="Paste the page source here (Ctrl+U in Chrome, then Ctrl+A → Ctrl+C)..." style="min-height:200px;font-family:'JetBrains Mono',monospace;font-size:11.5px"></textarea>
-        <div class="actions">
-          <button class="primary" id="hunter-paste-btn" onclick="startPasteHtml()">Extract Emails</button>
-          <button class="secondary" onclick="document.getElementById('hunter-paste-html').value=''">Clear</button>
-        </div>
-        <p class="helper" style="margin-top:8px">Extracts emails from HTML you already have — no network request. Filters above still apply.</p>
-        <div id="hunter-paste-status" class="status" style="margin-top:12px"></div>
-      </div>
-    </div>
-
     <div id="hunter-stats" class="bl-summary hidden" style="margin-top:20px"></div>
 
     <div class="card" id="hunter-emails-card" style="margin-top:20px;display:none">
       <h3>Emails Found (<span id="hunter-count">0</span>)</h3>
-      <div id="hunter-dropped-info" style="color:var(--muted);font-size:12px;margin-bottom:12px;line-height:1.7"></div>
       <div class="actions" style="margin-top:0;margin-bottom:12px">
         <button class="secondary" onclick="copyHunterEmails(this)">Copy Emails</button>
         <button class="secondary" onclick="exportHunterCsv()">Export CSV</button>
@@ -1659,6 +1429,12 @@ function dmarcTab(which) {
   $('dmarc-bulk-panel').classList.toggle('hidden', which !== 'bulk');
   $('dmarc-single-tab').classList.toggle('active', which === 'single');
   $('dmarc-bulk-tab').classList.toggle('active', which === 'bulk');
+}
+function hunterTab(which) {
+  $('hunter-single-panel').classList.toggle('hidden', which !== 'single');
+  $('hunter-bulk-panel').classList.toggle('hidden', which !== 'bulk');
+  $('hunter-single-tab').classList.toggle('active', which === 'single');
+  $('hunter-bulk-tab').classList.toggle('active', which === 'bulk');
 }
 function toggleTheme() {
   const light = document.body.classList.toggle('light');
@@ -1836,348 +1612,158 @@ function exportBlocklistCsv() {
   URL.revokeObjectURL(url); toast('CSV exported', 'ok');
 }
 
-/* ---------------- Email Hunter (V14) ---------------- */
-const hunterState = { abort: null, sid: null, pollTimer: null, data: null, mode: "single" };
+/* ---------------- Email Hunter ---------------- */
+const hunterState = { abort: null, sid: null, pollTimer: null, data: null, isBulk: false };
 
-function hunterTab(which) {
-  const panels = {
-    single: "hunter-single-panel",
-    bulk:   "hunter-bulk-panel",
-    quick:  "hunter-quick-panel",
-    paste:  "hunter-paste-panel",
-  };
-  Object.entries(panels).forEach(function (entry) {
-    const k = entry[0], id = entry[1];
-    $(id).classList.toggle("hidden", k !== which);
-    const tb = $("hunter-" + k + "-tab");
-    if (tb) tb.classList.toggle("active", k === which);
-  });
-}
-
-function collectHunterFilters() {
-  const lines = function (id) {
-    return $(id).value.split(/\r?\n/).map(function (x) { return x.trim(); }).filter(Boolean);
-  };
-  return {
-    exclude_free:  $("hf-exclude-free").checked,
-    exclude_roles: $("hf-exclude-roles").checked,
-    blocklist:     lines("hf-blocklist"),
-    whitelist:     lines("hf-whitelist"),
-    pattern:       $("hf-pattern").value.trim(),
-    mx_check:      $("hf-mx-check").checked,
-  };
-}
-
-function showHunterProgress(mode, show) {
-  const map = {
-    single: ["hunter-progress", "hunter-progress-bar"],
-    bulk:   ["hunter-bulk-progress", "hunter-bulk-progress-bar"],
-    quick:  ["hunter-quick-progress", "hunter-quick-progress-bar"],
-  };
-  const ids = map[mode];
-  if (!ids) return;
-  const wrap = $(ids[0]), bar = $(ids[1]);
-  if (!wrap || !bar) return;
-  if (show) { wrap.classList.remove("hidden"); bar.style.width = "8%"; }
-  else { wrap.classList.add("hidden"); bar.style.width = "0%"; }
-}
-
-function setHunterBar(mode, pct) {
-  const map = {
-    single: "hunter-progress-bar",
-    bulk:   "hunter-bulk-progress-bar",
-    quick:  "hunter-quick-progress-bar",
-  };
-  const el = $(map[mode]);
-  if (el) el.style.width = pct + "%";
-}
-
-function hunterStatusEl(mode) {
-  if (mode === "bulk")  return $("hunter-bulk-status");
-  if (mode === "quick") return $("hunter-quick-status");
-  if (mode === "paste") return $("hunter-paste-status");
-  return $("hunter-status");
-}
-
-function finishHunterUi(mode) {
-  const btnMap = {
-    single: "hunter-btn",
-    bulk:   "hunter-bulk-btn",
-    quick:  "hunter-quick-btn",
-    paste:  "hunter-paste-btn",
-  };
-  const cancelMap = {
-    single: "hunter-cancel",
-    bulk:   "hunter-bulk-cancel",
-    quick:  "hunter-quick-cancel",
-  };
-  const btn = $(btnMap[mode]);
-  if (btn) {
-    btn.disabled = false;
-    btn.textContent =
-      mode === "bulk"  ? "Start Bulk Crawl" :
-      mode === "quick" ? "Quick Extract" :
-      mode === "paste" ? "Extract Emails" : "Start Crawl";
-  }
-  const cbtn = cancelMap[mode] ? $(cancelMap[mode]) : null;
-  if (cbtn) cbtn.disabled = true;
-  hunterState.abort = null;
-  hunterState.sid = null;
-  if (hunterState.pollTimer) { clearInterval(hunterState.pollTimer); hunterState.pollTimer = null; }
-}
-
-/* ---------- SINGLE + BULK CRAWL ---------- */
 async function startEmailHunter(isBulk) {
-  const mode = isBulk ? "bulk" : "single";
-  hunterState.mode = mode;
-  const urlInput = isBulk ? $("hunter-urls").value.trim() : $("hunter-url").value.trim();
-  if (!urlInput) { toast("Enter at least one URL", "err"); return; }
+  const urlInput = isBulk ? $('hunter-urls').value.trim() : $('hunter-url').value.trim();
+  if (!urlInput) { toast('Enter at least one URL', 'err'); return; }
 
-  const btn = isBulk ? $("hunter-bulk-btn") : $("hunter-btn");
-  const cancelBtn = isBulk ? $("hunter-bulk-cancel") : $("hunter-cancel");
-  const status = hunterStatusEl(mode);
+  hunterState.isBulk = isBulk;
+  const btn = isBulk ? $('hunter-bulk-btn') : $('hunter-btn');
+  const cancelBtn = isBulk ? $('hunter-bulk-cancel') : $('hunter-cancel');
+  const status = isBulk ? $('hunter-bulk-status') : $('hunter-status');
+  const progress = isBulk ? $('hunter-bulk-progress') : $('hunter-progress');
+  const bar = isBulk ? $('hunter-bulk-progress-bar') : $('hunter-progress-bar');
 
   hunterState.abort = new AbortController();
   hunterState.data = null;
 
-  btn.disabled = true; btn.textContent = "Crawling…";
-  cancelBtn.disabled = false;
-  showHunterProgress(mode, true);
-  $("hunter-stats").classList.add("hidden");
-  $("hunter-emails-card").style.display = "none";
+  btn.disabled = true; btn.textContent = 'Crawling…'; cancelBtn.disabled = false;
+  progress.classList.remove('hidden'); bar.style.width = '8%';
+  $('hunter-stats').classList.add('hidden');
+  $('hunter-emails-card').style.display = 'none';
 
   const startedAt = Date.now();
   const tick = setInterval(function () {
     const s = ((Date.now() - startedAt) / 1000).toFixed(0);
-    status.textContent = "Crawling… " + s + "s elapsed (max 150s)";
-    setHunterBar(mode, Math.min(95, 8 + (Number(s) / 150) * 87));
+    status.textContent = 'Starting crawl… running ' + s + 's (max 240s)';
+    const pct = Math.min(95, 8 + (Number(s) / 240) * 87);
+    bar.style.width = pct.toFixed(1) + '%';
   }, 1000);
-  status.textContent = "Starting crawl…";
-
-  const filters = collectHunterFilters();
-  const mx_check = filters.mx_check;
-  delete filters.mx_check;
+  status.textContent = 'Starting crawl… running 0s';
 
   try {
     const body = isBulk ? { urls: urlInput } : { url: urlInput };
-    body.filters = filters;
-    body.mx_check = mx_check;
-
-    const d = await api("/api/email-hunter/start", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+    const d = await api('/api/email-hunter/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
       signal: hunterState.abort.signal,
     });
     hunterState.sid = d.session_id;
     clearInterval(tick);
-    pollHunterResults(startedAt, tick, mode);
+    pollHunterResults(startedAt, tick, isBulk);
   } catch (e) {
-    clearInterval(tick);
-    finishHunterUi(mode);
-    showHunterProgress(mode, false);
-    if (e.name === "AbortError") status.textContent = "Cancelled.";
-    else { status.textContent = e.message; toast(e.message, "err"); }
+    clearInterval(tick); finishHunterUi(isBulk);
+    if (e.name === 'AbortError') status.textContent = 'Cancelled.';
+    else { status.textContent = e.message; toast(e.message, 'err'); }
   }
 }
 
-function pollHunterResults(startedAt, tick, mode) {
-  const status = hunterStatusEl(mode);
+function pollHunterResults(startedAt, tick, isBulk) {
+  const status = isBulk ? $('hunter-bulk-status') : $('hunter-status');
   hunterState.pollTimer = setInterval(async function () {
     if (!hunterState.sid) return;
     try {
-      const d = await api("/api/email-hunter/results/" + hunterState.sid, { method: "GET" });
-      if (d.status === "running") {
-        const s = ((Date.now() - startedAt) / 1000).toFixed(0);
-        setHunterBar(mode, Math.min(95, 8 + (Number(s) / 150) * 87));
-        return;
-      }
+      const d = await api('/api/email-hunter/results/' + hunterState.sid, { method: 'GET' });
+      if (d.status === 'running') return;
       clearInterval(tick);
       if (hunterState.pollTimer) { clearInterval(hunterState.pollTimer); hunterState.pollTimer = null; }
-      if (d.error) {
-        status.textContent = "Error: " + d.error;
-        toast(d.error, "err");
-        finishHunterUi(mode);
-        showHunterProgress(mode, false);
-        return;
-      }
+      if (d.error) { status.textContent = 'Error: ' + d.error; toast(d.error, 'err'); finishHunterUi(isBulk); return; }
       hunterState.data = d;
-      displayHunterResults(d, mode);
-      finishHunterUi(mode);
-      setHunterBar(mode, 100);
-      setTimeout(function () { showHunterProgress(mode, false); }, 700);
+      displayHunterResults(d, isBulk);
+      finishHunterUi(isBulk);
+      const prog = isBulk ? $('hunter-bulk-progress') : $('hunter-progress');
+      const pb = isBulk ? $('hunter-bulk-progress-bar') : $('hunter-progress-bar');
+      pb.style.width = '100%';
+      setTimeout(function () { prog.classList.add('hidden'); }, 700);
     } catch (e) {
       clearInterval(tick);
       if (hunterState.pollTimer) { clearInterval(hunterState.pollTimer); hunterState.pollTimer = null; }
       status.textContent = e.message;
-      finishHunterUi(mode);
-      showHunterProgress(mode, false);
+      finishHunterUi(isBulk);
     }
   }, 1500);
 }
 
-/* ---------- QUICK EXTRACT (single page, no crawl) ---------- */
-async function startQuickExtract() {
-  const mode = "quick";
-  hunterState.mode = mode;
-  const url = $("hunter-quick-url").value.trim();
-  if (!url) { toast("Enter a URL first", "err"); return; }
-
-  const btn = $("hunter-quick-btn");
-  const cancelBtn = $("hunter-quick-cancel");
-  const status = hunterStatusEl(mode);
-
-  hunterState.abort = new AbortController();
-  hunterState.data = null;
-
-  btn.disabled = true; btn.textContent = "Fetching…";
-  cancelBtn.disabled = false;
-  showHunterProgress(mode, true);
-  setHunterBar(mode, 30);
-  $("hunter-stats").classList.add("hidden");
-  $("hunter-emails-card").style.display = "none";
-  status.textContent = "Fetching page…";
-
-  const filters = collectHunterFilters();
-  const mx_check = filters.mx_check;
-  delete filters.mx_check;
-
-  try {
-    const d = await api("/api/email-hunter/quick", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: url, filters: filters, mx_check: mx_check }),
-      signal: hunterState.abort.signal,
-    });
-    setHunterBar(mode, 100);
-    hunterState.data = d;
-    displayHunterResults(d, mode);
-    toast("Quick extract complete", "ok");
-  } catch (e) {
-    if (e.name === "AbortError") status.textContent = "Cancelled.";
-    else { status.textContent = e.message; toast(e.message, "err"); }
-  } finally {
-    finishHunterUi(mode);
-    setTimeout(function () { showHunterProgress(mode, false); }, 700);
-  }
-}
-
-/* ---------- PASTE HTML ---------- */
-async function startPasteHtml() {
-  const mode = "paste";
-  hunterState.mode = mode;
-  const html = $("hunter-paste-html").value;
-  if (!html.trim()) { toast("Paste some HTML first", "err"); return; }
-
-  const btn = $("hunter-paste-btn");
-  const status = hunterStatusEl(mode);
-  hunterState.data = null;
-
-  btn.disabled = true; btn.textContent = "Extracting…";
-  $("hunter-stats").classList.add("hidden");
-  $("hunter-emails-card").style.display = "none";
-  status.textContent = "Parsing HTML…";
-
-  const filters = collectHunterFilters();
-  const mx_check = filters.mx_check;
-  delete filters.mx_check;
-
-  try {
-    const d = await api("/api/email-hunter/paste-html", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ html: html, filters: filters, mx_check: mx_check }),
-    });
-    hunterState.data = d;
-    displayHunterResults(d, mode);
-    toast("Extracted from pasted HTML", "ok");
-  } catch (e) {
-    status.textContent = e.message;
-    toast(e.message, "err");
-  } finally {
-    finishHunterUi(mode);
-  }
-}
-
-/* ---------- RESULT DISPLAY ---------- */
-function displayHunterResults(d, mode) {
+function displayHunterResults(d, isBulk) {
   const s = d.stats || {};
-  const stats = $("hunter-stats");
+  const stats = $('hunter-stats');
   const items = [
-    ["Emails",     s.emails || 0],
-    ["Raw Found",  s.raw_emails || s.emails || 0],
-    ["Pages",      s.pages_visited || 0],
-    ["Contact",    s.contact_pages || 0],
-    ["Nav",        s.nav_pages || 0],
-    ["Errors",     s.errors || 0],
-    ["Time (s)",   s.time_taken || 0],
+    ['Emails', s.emails || 0],
+    ['Pages Visited', s.pages_visited || 0],
+    ['Contact Pages', s.contact_pages || 0],
+    ['Nav Pages', s.nav_pages || 0],
+    ['Discovered', s.discovered || 0],
+    ['Errors', s.errors || 0],
+    ['Time (s)', s.time_taken || 0],
   ];
   stats.innerHTML = items.map(function (x) {
     return '<div class="bl-summary-item"><b>' + esc(x[1]) + '</b><span>' + esc(x[0]) + '</span></div>';
-  }).join("");
-  stats.classList.remove("hidden");
+  }).join('');
+  stats.classList.remove('hidden');
 
   const emails = d.emails || [];
-  $("hunter-count").textContent = emails.length;
+  $('hunter-count').textContent = emails.length;
 
-  const dropped = d.dropped || {};
-  const mxDead = d.mx_dead || [];
-  const info = [];
-  if (dropped.free)      info.push("Free providers dropped: " + dropped.free);
-  if (dropped.role)      info.push("Role accounts dropped: " + dropped.role);
-  if (dropped.block)     info.push("Blocklist dropped: " + dropped.block);
-  if (dropped.not_white) info.push("Not on whitelist: " + dropped.not_white);
-  if (dropped.pattern)   info.push("Pattern mismatch: " + dropped.pattern);
-  if (mxDead.length)     info.push("MX-dead domains: " + mxDead.length);
-  $("hunter-dropped-info").textContent = info.length ? ("Filtered out → " + info.join(" · ")) : "";
-
-  const tbody = $("hunter-emails-tbody");
+  const tbody = $('hunter-emails-tbody');
   if (!emails.length) {
     tbody.innerHTML = '<tr><td style="text-align:center;color:var(--muted);padding:24px">No emails found.</td></tr>';
   } else {
     tbody.innerHTML = emails.map(function (e) {
       return '<tr><td class="hunter-email-cell">' + esc(e) + '</td></tr>';
-    }).join("");
+    }).join('');
   }
-  $("hunter-emails-card").style.display = "block";
+  $('hunter-emails-card').style.display = 'block';
 
-  const status = hunterStatusEl(mode);
-  const urlsCount = (d.urls && d.urls.length) ? d.urls.length : 0;
-  if (mode === "quick") {
-    status.textContent = "Done — " + emails.length + " email" + (emails.length === 1 ? "" : "s") + " (single page) in " + (s.time_taken || 0) + "s.";
-  } else if (mode === "paste") {
-    status.textContent = "Done — " + emails.length + " email" + (emails.length === 1 ? "" : "s") + " from pasted HTML.";
-  } else {
-    status.textContent = "Done — " + emails.length + " email" + (emails.length === 1 ? "" : "s") +
-                         " from " + urlsCount + " URL" + (urlsCount === 1 ? "" : "s") +
-                         " in " + (s.time_taken || 0) + "s.";
-  }
+  const urlsCount = (d.urls && d.urls.length) ? d.urls.length : 1;
+  const target = isBulk ? $('hunter-bulk-status') : $('hunter-status');
+  target.textContent = 'Done — ' + emails.length + ' email' + (emails.length === 1 ? '' : 's') +
+                       ' from ' + urlsCount + ' URL' + (urlsCount === 1 ? '' : 's') +
+                       ' in ' + (s.time_taken || 0) + 's.';
 }
 
-/* ---------- CANCEL ---------- */
+function finishHunterUi(isBulk) {
+  const btn = isBulk ? $('hunter-bulk-btn') : $('hunter-btn');
+  const cancelBtn = isBulk ? $('hunter-bulk-cancel') : $('hunter-cancel');
+  btn.disabled = false;
+  btn.textContent = isBulk ? 'Start Bulk Crawl' : 'Start Crawl';
+  cancelBtn.disabled = true;
+  hunterState.abort = null;
+}
+
 function cancelEmailHunter() {
   if (hunterState.pollTimer) { clearInterval(hunterState.pollTimer); hunterState.pollTimer = null; }
   if (hunterState.abort) hunterState.abort.abort();
-  const mode = hunterState.mode || "single";
-  finishHunterUi(mode);
-  hunterStatusEl(mode).textContent = "Cancelled.";
-  ["single", "bulk", "quick"].forEach(function (m) { showHunterProgress(m, false); });
+  ['hunter', 'hunter-bulk'].forEach(function (prefix) {
+    const btn = $(prefix + '-btn');
+    const cancelBtn = $(prefix + '-cancel');
+    if (btn) { btn.disabled = false; btn.textContent = prefix === 'hunter-bulk' ? 'Start Bulk Crawl' : 'Start Crawl'; }
+    if (cancelBtn) cancelBtn.disabled = true;
+  });
+  $('hunter-status').textContent = 'Cancelled.';
+  $('hunter-bulk-status').textContent = 'Cancelled.';
+  hunterState.abort = null;
+  setTimeout(function () {
+    $('hunter-progress').classList.add('hidden');
+    $('hunter-bulk-progress').classList.add('hidden');
+  }, 500);
 }
 
-/* ---------- COPY / EXPORT ---------- */
 async function copyHunterEmails(btn) {
-  if (!hunterState.data || !hunterState.data.emails) { toast("Nothing to copy", "err"); return; }
-  await copyValue(hunterState.data.emails.join("\n"), btn);
+  if (!hunterState.data || !hunterState.data.emails) { toast('Nothing to copy', 'err'); return; }
+  await copyValue(hunterState.data.emails.join('\n'), btn);
 }
 
 function exportHunterCsv() {
-  if (!hunterState.data || !hunterState.data.emails) { toast("Nothing to export", "err"); return; }
-  const lines = ["Email"].concat(hunterState.data.emails);
-  const blob = new Blob([lines.join("\r\n")], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob); const a = document.createElement("a");
-  a.href = url; a.download = "emails-hunted.csv";
+  if (!hunterState.data || !hunterState.data.emails) { toast('Nothing to export', 'err'); return; }
+  const lines = ['Email'].concat(hunterState.data.emails);
+  const blob = new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob); const a = document.createElement('a');
+  a.href = url; a.download = 'emails-hunted.csv';
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
-  URL.revokeObjectURL(url); toast("CSV exported", "ok");
+  URL.revokeObjectURL(url); toast('CSV exported', 'ok');
 }
 
 /* ---------------- DMARC Lookup ---------------- */
@@ -2383,7 +1969,6 @@ document.addEventListener('keydown', function (e) {
     if (active && active.id === 'enc-input') encodeText();
     if (active && active.id === 'dec-input') decodeText();
     if (active && active.id === 'hunter-url') startEmailHunter(false);
-    if (active && active.id === 'hunter-quick-url') startQuickExtract();
     if (active && active.id === 'dmarc-domain') runDmarcCheck();
   }
 });
@@ -2666,6 +2251,7 @@ def _generate_word(min_len, max_len):
     return w[:n]
 
 
+# Real English words mixed into styled generator output
 REAL_WORDS = [
     "fierce", "strong", "warm", "rain", "fire", "stone", "wind", "iron",
     "storm", "cloud", "silver", "golden", "shadow", "light", "dark", "bright",
@@ -2685,31 +2271,43 @@ def _styled_word(min_len=2, max_len=6):
       f-ierce_ga.lax-strong_me.ado-warm_rain.68
       st+rong_wind.75
       me.ado-f-ierce_rain_glow.8921
+
+    Structure:
+      - 4-6 word-like segments (real words + pronounceable chunks)
+      - Join with random separators: '-' '_' '.'
+      - Random single letters injected inside words using '+' or '-'
+      - Random 2-4 digit number at the end
     """
     n_segments = random.randint(4, 6)
     segments = []
 
     for _ in range(n_segments):
+        # Real word OR pronounceable chunk
         if random.random() < 0.55:
             w = random.choice(REAL_WORDS)
         else:
             w = _generate_word(min_len, max_len).lower()
 
+        # Inject a single letter inside using '+' or '-' (in-between letter)
         if len(w) >= 4 and random.random() < 0.40:
             pos = random.randint(1, len(w) - 1)
             letter = random.choice(string.ascii_lowercase)
             sep = random.choice(["-", "+"])
             w = w[:pos] + sep + letter + w[pos:]
+
+        # Sometimes append a random single letter with '-' or '+' as its own tail
         elif random.random() < 0.25:
             w = w + random.choice(["-", "+"]) + random.choice(string.ascii_lowercase)
 
         segments.append(w)
 
+    # Join segments with random separators
     separators = ["-", "_", "."]
     result = segments[0]
     for seg in segments[1:]:
         result += random.choice(separators) + seg
 
+    # Append random number at end
     result += "." + str(random.randint(10, 9999))
     return result
 
@@ -3451,31 +3049,13 @@ def email_hunter_start():
                     crawler = None
                     gc.collect()
 
-            # ---- apply filters + optional MX check ----
-            filters = data.get("filters") or {}
-            mx_check = bool(data.get("mx_check"))
-
-            raw_sorted = sorted(all_emails)
-            filtered, dropped = apply_email_filters(raw_sorted, filters)
-
-            mx_dead = []
-            if mx_check and filtered:
-                filtered, mx_dead = filter_mx(filtered)
-
-            agg["emails"] = len(filtered)
-            agg["raw_emails"] = len(raw_sorted)
-            agg["dropped"] = dropped
-            agg["mx_dead_count"] = len(mx_dead)
+            agg["emails"] = len(all_emails)
             agg["time_taken"] = round(time.time() - start_t, 2)
-
-            keep_set = set(filtered)
             _hunter_store[sid] = {
-                "emails": filtered,
-                "email_sources": {e: sorted(list(us)) for e, us in all_sources.items() if e in keep_set},
+                "emails": sorted(all_emails),
+                "email_sources": {e: sorted(list(us)) for e, us in all_sources.items()},
                 "stats": agg,
                 "urls": normalized,
-                "dropped": dropped,
-                "mx_dead": mx_dead,
             }
             _hunter_status[sid] = "completed"
         except Exception as e:
@@ -3495,118 +3075,6 @@ def email_hunter_results(sid):
         return jsonify(status="running")
     result = _hunter_store.get(sid) or {"error": "No results"}
     return jsonify(status=status, **result)
-
-
-# ============================================================
-# Email Hunter — Quick extract (single page, no crawl)
-# ============================================================
-@app.post("/api/email-hunter/quick")
-def email_hunter_quick():
-    if not HAS_HUNTER:
-        return jsonify(error="Email Hunter deps missing."), 500
-    data = request.get_json(silent=True) or {}
-    url = str(data.get("url", "")).strip()
-    if not url:
-        return jsonify(error="Enter a URL."), 400
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-
-    filters  = data.get("filters") or {}
-    mx_check = bool(data.get("mx_check"))
-
-    crawler = None
-    t0 = time.time()
-    html = None
-    try:
-        crawler = EmailHunterCrawler(url)
-        html = crawler._fetch(url)
-    except Exception as e:
-        _log(f"[QUICK ERR] {url} :: {e}")
-        html = None
-    finally:
-        if crawler is not None:
-            try: crawler.session.close()
-            except Exception: pass
-
-    if not html:
-        return jsonify(error="Could not fetch page (blocked or unreachable)."), 502
-
-    raw = extract_from_html_blob(html)
-    raw_list = sorted(raw)
-    filtered, dropped = apply_email_filters(raw_list, filters)
-
-    mx_dead = []
-    if mx_check and filtered:
-        filtered, mx_dead = filter_mx(filtered)
-
-    return jsonify(
-        emails=filtered,
-        count=len(filtered),
-        raw_count=len(raw_list),
-        dropped=dropped,
-        mx_dead=mx_dead,
-        stats={
-            "emails": len(filtered),
-            "raw_emails": len(raw_list),
-            "pages_visited": 1,
-            "contact_pages": 0,
-            "nav_pages": 0,
-            "errors": 0,
-            "discovered": 1,
-            "visited": 1,
-            "urls_crawled": 1,
-            "urls_total": 1,
-            "time_taken": round(time.time() - t0, 2),
-        },
-        urls=[url],
-    )
-
-
-# ============================================================
-# Email Hunter — Paste HTML extract
-# ============================================================
-@app.post("/api/email-hunter/paste-html")
-def email_hunter_paste_html():
-    if not HAS_HUNTER:
-        return jsonify(error="Email Hunter deps missing."), 500
-    data = request.get_json(silent=True) or {}
-    html = str(data.get("html", ""))
-    if not html.strip():
-        return jsonify(error="Paste some HTML first."), 400
-
-    filters  = data.get("filters") or {}
-    mx_check = bool(data.get("mx_check"))
-    t0 = time.time()
-
-    raw = extract_from_html_blob(html)
-    raw_list = sorted(raw)
-    filtered, dropped = apply_email_filters(raw_list, filters)
-
-    mx_dead = []
-    if mx_check and filtered:
-        filtered, mx_dead = filter_mx(filtered)
-
-    return jsonify(
-        emails=filtered,
-        count=len(filtered),
-        raw_count=len(raw_list),
-        dropped=dropped,
-        mx_dead=mx_dead,
-        stats={
-            "emails": len(filtered),
-            "raw_emails": len(raw_list),
-            "pages_visited": 0,
-            "contact_pages": 0,
-            "nav_pages": 0,
-            "errors": 0,
-            "discovered": 0,
-            "visited": 0,
-            "urls_crawled": 0,
-            "urls_total": 0,
-            "time_taken": round(time.time() - t0, 2),
-        },
-        urls=[],
-    )
 
 
 # ============================================================
