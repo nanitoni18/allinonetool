@@ -8,6 +8,9 @@
 #   2) cloudscraper
 #   3) requests with retry
 #   4) Playwright (real headless browser — worst-case fallback)
+#
+# V15: keep_alive_ping integration — prevents Render free-tier
+#      cold starts. See _start_keep_alive() near the bottom.
 # ============================================================
 from flask import Flask, request, jsonify, session, redirect, url_for, Response
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -38,14 +41,14 @@ try:
 except ImportError:
     HAS_CLOUDSCRAPER = False
 
-# NEW: curl_cffi — real Chrome TLS fingerprint (best Cloudflare bypass)
+# curl_cffi — real Chrome TLS fingerprint (best Cloudflare bypass)
 try:
     from curl_cffi import requests as cffi_requests
     HAS_CFFI = True
 except ImportError:
     HAS_CFFI = False
 
-# NEW: Playwright — real headless browser fallback
+# Playwright — real headless browser fallback
 try:
     from playwright.sync_api import sync_playwright
     HAS_PLAYWRIGHT = True
@@ -502,10 +505,7 @@ if HAS_HUNTER:
                 "Connection": "keep-alive",
             }
 
-            # ============================================================
             # LAYER 1: curl_cffi — real Chrome TLS fingerprint
-            # Best Cloudflare / WAF bypass. Returns 200 where requests gets 503.
-            # ============================================================
             if HAS_CFFI:
                 try:
                     r = cffi_requests.get(
@@ -539,9 +539,7 @@ if HAS_HUNTER:
                 except Exception as e:
                     _log(f"[HUNTER CFFI-ERR] {url} :: {type(e).__name__}: {e}")
 
-            # ============================================================
             # LAYER 2: cloudscraper
-            # ============================================================
             if self.scraper is not None:
                 try:
                     r = self.scraper.get(url, headers=headers, timeout=HUNTER_TIMEOUT,
@@ -565,9 +563,7 @@ if HAS_HUNTER:
                 except Exception as e:
                     _log(f"[HUNTER CS-ERR] {url} :: {type(e).__name__}: {e}")
 
-            # ============================================================
-            # LAYER 3: plain requests with retry (original behavior)
-            # ============================================================
+            # LAYER 3: plain requests with retry
             try:
                 r = self.session.get(url, headers=headers, timeout=HUNTER_TIMEOUT,
                                      allow_redirects=True, verify=False, stream=True)
@@ -612,10 +608,7 @@ if HAS_HUNTER:
                 self.host_failures[host] = self.host_failures.get(host, 0) + 1
                 _log(f"[HUNTER REQ-ERR] {url} :: {type(e).__name__}: {e}")
 
-            # ============================================================
             # LAYER 4: Playwright — real headless browser (final fallback)
-            # Use only when 3 previous layers all failed. Heavier but bulletproof.
-            # ============================================================
             if HAS_PLAYWRIGHT:
                 try:
                     text = self._fetch_playwright(url)
@@ -999,7 +992,7 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
         <path d="M32 5 55 18v28L32 59 9 46V18z" fill="none" stroke="url(#lg)" stroke-width="3.5" stroke-linejoin="round"/>
         <text x="32" y="40" text-anchor="middle" font-family="Space Grotesk,sans-serif" font-size="19" font-weight="700" fill="url(#lg)">EJ</text>
       </svg>
-      <div><b>Email journeys</b><span>NEON NEXUS · V13</span></div>
+      <div><b>Email journeys</b><span>NEON NEXUS · V15</span></div>
     </div>
     <nav class="nav">
       <button id="nav-home" onclick="showPage('home')">Home</button>
@@ -3075,6 +3068,59 @@ def email_hunter_results(sid):
         return jsonify(status="running")
     result = _hunter_store.get(sid) or {"error": "No results"}
     return jsonify(status=status, **result)
+
+
+# ============================================================
+# Keep-Alive Ping — prevents Render free-tier cold starts
+# Requires: pip install keep_alive_ping
+# Environment (optional):
+#   DISABLE_KEEP_ALIVE=1         → skip starting the service
+#   KEEP_ALIVE_PORT=5001         → internal port (default 5001)
+#   KEEP_ALIVE_INTERVAL=120      → ping interval seconds (default 120)
+#   KEEP_ALIVE_ENDPOINT=healthz  → path to ping (default healthz)
+#   KEEP_ALIVE_URL               → override external URL (auto on Render)
+# ============================================================
+def _start_keep_alive():
+    if os.environ.get("DISABLE_KEEP_ALIVE", "").strip().lower() in ("1", "true", "yes"):
+        _log("[KEEP-ALIVE] Disabled via DISABLE_KEEP_ALIVE env var")
+        return
+
+    try:
+        from keep_alive_ping import create_service
+    except ImportError:
+        _log("[KEEP-ALIVE] keep_alive_ping not installed — skipping (pip install keep_alive_ping)")
+        return
+
+    try:
+        ping_port = int(os.environ.get("KEEP_ALIVE_PORT", "5001"))
+        ping_interval = int(os.environ.get("KEEP_ALIVE_INTERVAL", "120"))
+        ping_endpoint = os.environ.get("KEEP_ALIVE_ENDPOINT", "healthz")
+        external_url = (
+            os.environ.get("RENDER_EXTERNAL_URL")
+            or os.environ.get("KEEP_ALIVE_URL")
+            or ""
+        ).strip() or None
+
+        create_service(
+            port=ping_port,
+            ping_interval=ping_interval,
+            ping_endpoint=ping_endpoint,
+            external_url=external_url,
+            log_level="INFO",
+        )
+        _log(
+            f"[KEEP-ALIVE] Started — port={ping_port} "
+            f"interval={ping_interval}s endpoint=/{ping_endpoint} "
+            f"url={external_url or 'auto-detect'}"
+        )
+    except OSError as e:
+        # Port already bound (usually from multi-worker Gunicorn) — safe to ignore.
+        _log(f"[KEEP-ALIVE] Port busy — skipped (multi-worker?): {e}")
+    except Exception as e:
+        _log(f"[KEEP-ALIVE] Failed to start: {type(e).__name__}: {e}")
+
+
+_start_keep_alive()
 
 
 # ============================================================
