@@ -2,6 +2,9 @@ flask
 werkzeug
 requests
 beautifulsoup4
-cloudscraper
 dnspython
-gunicorn
+keep_alive_ping
+# Optional (Email Hunter fallback layers)
+curl_cffi
+cloudscraper
+playwright
